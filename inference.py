@@ -974,7 +974,7 @@ def run_task(task_id: str, policy_memory: PolicyMemory) -> float:
                     "action": ev.get("action", ""),
                     "reward": ev.get("reward", 0),
                 })
-            http.post(f"{ENV_BASE_URL}/result", json={
+            http.post(f"{ENV_BASE_URL}/record", json={
                 "tier": task_id,
                 "score": score,
                 "steps": steps_taken,

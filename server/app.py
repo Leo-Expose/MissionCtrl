@@ -200,8 +200,11 @@ async def results() -> List[Dict[str, Any]]:
     return _completed_results
 
 
-@app.post("/result")
-async def post_result(req: ResultRequest) -> Dict[str, str]:
+# ---------------------------------------------------------------------------
+# POST /record — explicitly push a completed episode result to the dashboard
+# ---------------------------------------------------------------------------
+@app.post("/record")
+async def record_result(req: ResultRequest) -> Dict[str, str]:
     """Accept a completed task result pushed by the inference script."""
     _completed_results.append({
         "tier": req.tier,

@@ -9,3 +9,6 @@ dist/
 build/
 missionctrl_checkpoints/
 reward_curve.png
+.codex
+AGENTS.md
+graphify-out
