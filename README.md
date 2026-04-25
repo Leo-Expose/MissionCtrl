@@ -19,7 +19,7 @@ tags:
 [![OpenEnv Compatible](https://img.shields.io/badge/OpenEnv-Compatible-6366f1?style=flat-square)](https://huggingface.co/openenv)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3b82f6?style=flat-square)](https://www.python.org/)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-10b981?style=flat-square)](https://www.docker.com/)
-[![Tests](https://img.shields.io/badge/Tests-81%20passing-34d399?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-86%20passing-34d399?style=flat-square)]()
 
 ---
 
@@ -358,6 +358,17 @@ pytest tests/ -v
 | `SPINNER_ENABLED` | `0` | Enable CLI spinner while waiting for LLM response |
 | `MAX_STEPS` | `5` | Steps per episode |
 
+#### GRPO / LoRA training (optional)
+
+Set these in the shell or Colab **before** running `train.py` (not read from `.env` by default):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MISSIONCTRL_LORA_RANK` | `16` | LoRA rank. Council guidance: start at 16; try `32` if a baseline run plateaus. |
+| `MISSIONCTRL_EARLY_STOP_PHASE1` | `1` | If set to `1`, enables early stop when phase 1 (easy) reward is flat after a minimum step count. |
+| `MISSIONCTRL_EARLY_STOP_MIN_STEPS` | `75` | Minimum training steps in phase 1 before the flat-reward check applies. |
+| `MISSIONCTRL_EARLY_STOP_LOG_WINDOW` | `3` | Number of recent `logging_steps` log points used to detect a flat reward. |
+
 ### Configuration Notes
 
 **Inference vs Training:**
@@ -365,6 +376,22 @@ pytest tests/ -v
 - The `train.py` script uses **local Unsloth** for GRPO fine-tuning (separate stack from inference)
 - For training, you only need to set `HF_REPO` in `train.py` and authenticate with HuggingFace
 - For inference, configure `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` in `.env`
+
+### Evaluation and training alignment checklist
+
+Hackathon and OpenEnv evaluators run **`inference.py` / `client.py` against your configured API**, not the Unsloth process. Fine-tuning improves the score only if the **same** `API_BASE_URL` and `MODEL_NAME` point at a stack that actually loads your trained adapter.
+
+1. **Confirm the scoring model** — After `train.py` pushes a LoRA adapter to HuggingFace, point inference at a **router or provider** that can serve the **base** `Qwen/Qwen2.5-7B-Instruct` (or your chosen base) **plus** that adapter. If you leave defaults (`openai/gpt-oss-120b`, Groq `llama-3.3-70b-versatile`, etc.), you are not evaluating the weights you trained.
+2. **Match base model ID** — Training in `train.py` defaults to `Qwen/Qwen2.5-7B-Instruct`. Your inference `MODEL_NAME` and adapter must be **compatible** with that base.
+3. **Reproduce before submit** — From the same repo: run the server, set `API_BASE_URL` / `MODEL_NAME` / `HF_TOKEN` in `.env` to the intended eval stack, then run `python client.py` or `python inference.py` and compare scores to a smoke run on a public baseline model.
+4. **HF Hub is adapter by default** — `train.py` calls `push_to_hub` for the PEFT/LoRA adapter. Consumers must load **base + adapter** (e.g. Unsloth/PEFT on Colab) unless you add a separate merge/publish step.
+
+**Training-only environment variables (optional, e.g. Colab or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
+
+### Colab and Cursor (user-colab-mcp)
+
+- **Google Colab:** Run `notebook.ipynb` or `train.py` in Colab with a GPU runtime. The training script can persist checkpoints under Google Drive when `google.colab` is available.
+- **Cursor / MCP:** If the **user-colab-mcp** server is enabled, the `open_colab_browser_connection` tool opens a **browser connection to a Colab session** so you can edit the notebook from the IDE. It does not run training on its own; you still execute cells or `train.py` in Colab.
 
 ### Troubleshooting: Request Too Large / TPM Errors
 
@@ -424,17 +451,21 @@ missionctrl/
 ├── Dockerfile             # Single-container deployment
 ├── client.py              # OpenEnv-required baseline evaluator entrypoint
 ├── inference.py           # Backward-compatible wrapper to client.main()
+├── environment.py         # MissionCtrlEnv — GRPO training / reward_model (local RL API)
 ├── .env.example           # API key template
 ├── server/
 │   ├── app.py             # FastAPI server (6 endpoints + dashboard)
-│   ├── environment.py     # Core engine, reward model, hallucination injector
+│   ├── environment.py     # MissionCtrlEngine — HTTP `/reset` + `/step` stack
 │   ├── dashboard.html     # Live visualization UI (accumulated results)
 │   └── requirements.txt   # Server dependencies
 └── tests/
     ├── conftest.py        # Shared fixtures
     ├── test_engine.py     # Engine + reward tests (37 tests)
-    └── test_api.py        # API contract tests (21 tests)
+    ├── test_api.py        # API contract tests (21 tests)
+    └── test_env_parity.py # Shared parse_action invariants (root vs server)
 ```
+
+**Two environment stacks:** `environment.py` (`MissionCtrlEnv`) drives **GRPO** and `reward_model.py`. `server/environment.py` (`MissionCtrlEngine`) powers the **live HTTP API** used by `inference.py`. They are related but not line-identical; `tests/test_env_parity.py` locks **action parsing** alignment. For identical episode dynamics across both paths, future work would consolidate onto one engine implementation.
 
 ### Agent Fleet
 

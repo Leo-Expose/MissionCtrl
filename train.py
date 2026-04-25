@@ -42,6 +42,7 @@ from pathlib import Path
 from unsloth import FastLanguageModel
 from trl import GRPOConfig, GRPOTrainer
 from datasets import Dataset
+from transformers import TrainerCallback
 
 # Local env
 sys.path.insert(0, os.path.dirname(__file__))
@@ -73,7 +74,8 @@ if HF_TOKEN:
 
 MODEL_NAME      = "Qwen/Qwen2.5-7B-Instruct"   # swap for Llama-3.1-8B-Instruct if preferred
 MAX_SEQ_LEN     = 4096
-LORA_RANK       = 16
+# Council: start at 16; try 32 if a baseline run plateaus. Override: MISSIONCTRL_LORA_RANK
+LORA_RANK       = int(os.environ.get("MISSIONCTRL_LORA_RANK", "16"))
 BATCH_SIZE      = 4
 GRAD_ACCUM      = 4                             # effective batch = 16
 LEARNING_RATE   = 2e-5
@@ -262,7 +264,9 @@ def grpo_reward_fn(completions: list[str], prompts: list, **kwargs) -> list[floa
     FIX #1: Now runs a FULL episode rollout (not just one step).
     The first action comes from the model completion; subsequent actions use a
     greedy policy (approve-all) to complete the episode. This gives a meaningful
-    multi-step reward signal rather than a single-step snapshot.
+    multi-step reward signal rather than a single-step snapshot. (A fuller
+    multi-step model rollout in the reward would reduce greedy-completion bias
+    but requires a larger TRL integration change.)
 
     FIX #3: Returns the FINAL reward (single composite score at episode end),
     not a sum of per-step rewards. compute_reward returns a state score [0,1],
@@ -591,6 +595,70 @@ def run_baseline() -> float:
     return mean
 
 
+# ── GRPO training callbacks (council: stop if easy-phase reward is flat) ─────
+
+def _extract_log_reward(logs: dict) -> float | None:
+    """Best-effort scalar from TRL/HF `on_log` payloads (keys vary by version)."""
+    for key in (
+        "rewards",
+        "reward",
+        "train/reward",
+        "train/reward_mean",
+        "grpo/reward",
+    ):
+        v = logs.get(key)
+        if v is None:
+            continue
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, (list, tuple)) and len(v) > 0:
+            return float(np.mean(v))
+    return None
+
+
+class FlatRewardEarlyStopCallback(TrainerCallback):
+    """
+    If easy-phase (curriculum index 0) reward stops moving after `min_step`, end the phase early.
+    Mitigates wasting Colab time on a noisy/flat GRPO signal (council guidance).
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        phase_index: int,
+        min_step: int = 75,
+        log_window: int = 3,
+        flat_delta: float = 0.02,
+    ):
+        self.enabled = bool(enabled) and phase_index == 0
+        self.min_step = min_step
+        self.log_window = max(2, log_window)
+        self.flat_delta = flat_delta
+        self._history: list[float] = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not self.enabled or logs is None:
+            return
+        if state.global_step < self.min_step:
+            return
+        val = _extract_log_reward(logs)
+        if val is None:
+            return
+        self._history.append(val)
+        self._history = self._history[-self.log_window :]
+        if len(self._history) < self.log_window:
+            return
+        if max(self._history) - min(self._history) < self.flat_delta:
+            control.should_training_stop = True
+            logger.warning(
+                "Early stop (easy phase): flat reward in last %d logs %s at step %s",
+                self.log_window,
+                self._history,
+                state.global_step,
+            )
+
+
 # ── Training Loop with Curriculum Gating ─────────────────────────────────────
 
 def train():
@@ -624,6 +692,14 @@ def train():
             )
             dataset = Dataset.from_list(samples)
 
+            early_cb = FlatRewardEarlyStopCallback(
+                enabled=os.environ.get("MISSIONCTRL_EARLY_STOP_PHASE1", "1").strip().lower()
+                in ("1", "true", "yes"),
+                phase_index=phase_idx,
+                min_step=int(os.environ.get("MISSIONCTRL_EARLY_STOP_MIN_STEPS", "75")),
+                log_window=int(os.environ.get("MISSIONCTRL_EARLY_STOP_LOG_WINDOW", "3")),
+            )
+
             grpo_config = GRPOConfig(
                 output_dir                  = f"{OUTPUT_DIR}/phase_{phase_idx + 1}_attempt_{phase_attempts}",
                 num_train_epochs            = 1,
@@ -647,6 +723,7 @@ def train():
                 reward_funcs = grpo_reward_fn,
                 args         = grpo_config,
                 train_dataset = dataset,
+                callbacks     = [early_cb],
             )
 
             trainer.train()
