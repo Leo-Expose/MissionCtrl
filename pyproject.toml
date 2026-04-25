@@ -31,6 +31,10 @@ inference = [
     "tenacity>=8.2.0",
     "python-dotenv>=1.0.0",
 ]
+# Local: python3 -m venv .venv-cli && .venv-cli/bin/pip install -e ".[kaggle]"
+kaggle = [
+    "kaggle>=1.6",
+]
 
 [project.scripts]
 server = "missionctrl.server.app:main"

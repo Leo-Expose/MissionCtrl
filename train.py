@@ -2,11 +2,19 @@
 MissionCtrl Training Script
 ============================
 GRPO fine-tuning with Unsloth on the MissionCtrl environment.
-Runs in Google Colab with the provided HuggingFace compute credits.
+Runs in Google Colab, Kaggle (2×T4), or a local GPU box.
 
-Requirements (run this cell first in Colab):
+Install (Colab / Kaggle notebook; adjust `unsloth[...]` per Unsloth if wheels fail):
   !pip install "unsloth[colab-new]" trl openenv transformers datasets accelerate matplotlib
   !pip install --upgrade bitsandbytes
+
+Kaggle: enable Internet; add Secret `HF_TOKEN` (gated models need license on HF). Prefer
+`%cd /kaggle/working` and clone the repo; checkpoints go to
+`/kaggle/working/missionctrl_checkpoints` (see `OUTPUT_DIR`). Accelerator: 2× T4.
+With 2+ GPUs, `device_map` defaults to "balanced" for model parallelism; set
+`MISSIONCTRL_DEVICE_MAP=0` to force a single device and rely on the trainer only.
+`accelerate launch` / multi-process DDP is not required for the default path; GRPO+Unsloth
+here is single-process. See README "Kaggle (2×T4 training)".
 
 Model  : default `unsloth/Llama-3.2-3B-Instruct` (full canary in one run). After 3B looks
 good, set `MISSIONCTRL_MODEL_NAME` to `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` (see
@@ -77,13 +85,15 @@ from reward_model import compute_reward, reward_breakdown
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Colab-specific: mount Google Drive for checkpoint persistence
+# Colab: Google Drive; Kaggle: writable /kaggle/working; else cwd-relative
+OUTPUT_DIR = "./missionctrl_checkpoints"
 try:
     from google.colab import drive
-    drive.mount('/content/drive')
+    drive.mount("/content/drive")
     OUTPUT_DIR = "/content/drive/MyDrive/missionctrl_checkpoints"
 except ImportError:
-    OUTPUT_DIR = "./missionctrl_checkpoints"
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.isdir("/kaggle/working"):
+        OUTPUT_DIR = "/kaggle/working/missionctrl_checkpoints"
 
 # Kaggle-specific: load HF_TOKEN from secrets
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -321,15 +331,28 @@ def _effective_curriculum() -> list[dict]:
 
 # ── Model Setup ───────────────────────────────────────────────────────────────
 
+def _device_map_for_load() -> str | None:
+    """2+ GPU: spread weights with 'balanced' unless disabled via MISSIONCTRL_DEVICE_MAP."""
+    if DEVICE_MAP is None:
+        return None
+    raw = os.environ.get("MISSIONCTRL_DEVICE_MAP", "1").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return None
+    return DEVICE_MAP
+
+
 def load_model():
     """Load base model with Unsloth optimizations and LoRA adapters."""
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    load_kwargs = dict(
         model_name     = MODEL_NAME,
         max_seq_length = MAX_SEQ_LEN,
-        dtype          = None,         # auto-detect: bf16 on Ampere+, fp16 otherwise
-        load_in_4bit   = True,         # QLoRA — fits in 16GB VRAM
-        # FIX #21: removed device_map="balanced" — Unsloth handles placement internally
+        dtype          = None,  # auto-detect: bf16 on Ampere+, fp16 otherwise
+        load_in_4bit   = True,  # QLoRA — fits in 16GB VRAM
     )
+    dm = _device_map_for_load()
+    if dm is not None:
+        load_kwargs["device_map"] = dm
+    model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
 
     model = FastLanguageModel.get_peft_model(
         model,
@@ -435,12 +458,13 @@ def evaluate(
                 tokenize              = False,
                 add_generation_prompt = True,
             )
+            mdev = getattr(model, "device", None) or next(model.parameters()).device
             inputs = tokenizer(
                 prompt_text,
                 return_tensors = "pt",
                 truncation     = True,
                 max_length     = MAX_SEQ_LEN - 512,
-            ).to(model.device)
+            ).to(mdev)
 
             with torch.no_grad():
                 outputs = model.generate(

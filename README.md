@@ -371,6 +371,88 @@ Set these in the shell or Colab **before** running `train.py` (not read from `.e
 | `MISSIONCTRL_EARLY_STOP_LOG_WINDOW` | `3` | Number of recent `logging_steps` log points used to detect a flat reward. |
 | `MISSIONCTRL_SMOKE_STEPS` | (unset) | If set to a positive integer, `train()` runs a single easy phase with that many `max_steps` and skips `push_to_hub` (GPU dry run). |
 | `MISSIONCTRL_T4_CURRICULUM` | (unset) | If `1`/`true`/`yes` on a **single** GPU, uses a shorter 100+150+100 step curriculum. |
+| `MISSIONCTRL_DEVICE_MAP` | `1` | On **2+ GPUs** (`device_map` path), set to `0`/`false`/`off` to skip passing `device_map="balanced"` to Unsloth (useful if a driver or Unsloth build misbehaves; training stays single-GPU in that case). |
+
+### Kaggle training and Kaggle CLI
+
+Training on Kaggle can be done **only in the browser** or with the **official [Kaggle CLI](https://github.com/Kaggle/kaggle-api)** to create a **kernel** and `push` a notebook. The same [`notebook.ipynb`](notebook.ipynb) is used: it has a **Kaggle (2×T4)** section. [`train.py`](train.py) needs the local modules `grpo_rewards.py`, `environment.py`, and `reward_model.py` (and any of their local imports) on the Python path—either by **cloning** a public git repo, by **attaching a Kaggle dataset** that contains the repo, or by **copying** those files next to the notebook in a CLI push folder.
+
+**API caveat — 2× T4:** [`kernel-metadata.json`](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md) can set `enable_gpu` and `enable_internet`, but **accelerator type and “2× T4” are not fully controlled** by a minimal JSON file. After the first `kernels push`, open the kernel in the Kaggle **editor** and set **2 × T4** under **Settings** (or configure once, then `kaggle kernels pull -k username/kernel-slug -m -p <dir>` to keep metadata that matches the UI; see the [Kaggle kernels docs](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels.md)).
+
+#### Prerequisites
+
+- A Kaggle account. For **gated** Unsloth bases, accept the license on HuggingFace and use a Kaggle **Secret** named `HF_TOKEN` (value is your `hf_...` token) with **Add-ons → Secrets → Attach to the environment** so `train.py` can log in.
+- The [`notebook.ipynb`](notebook.ipynb) clone cell defaults to `https://github.com/Fnc-Jit/MissionCtrl.git`; set **Add-ons → Environment** variable `MISSIONCTRL_REPO_URL` to your public fork if you do not use that default.
+- Local machine (for **Option B** only): a working [Kaggle CLI](https://github.com/Kaggle/kaggle-api) and auth (see [Local Kaggle CLI: install and token](#local-kaggle-cli-install-and-token) at the end of this section). Official metadata fields are [documented here](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md#contents).
+- In [`train.py`](train.py), set a real `HF_REPO` and **do not commit** your HuggingFace or Kaggle API tokens in the repository.
+
+#### Option A: Kaggle.com only (import the notebook, run training)
+
+1. Open **Kaggle** → **Code** → **New notebook**.
+2. In **Settings** (or the notebook’s sidebar), turn **Internet** **ON** (needed for `pip` and model downloads from HuggingFace). Set **2 × T4** under the accelerator for GRPO. Session length limits still apply; see [`train.py`](train.py) for the shorter 2-GPU curriculum.
+3. **Add-ons → Secrets**: add `HF_TOKEN` and check **Attach to the environment**.
+4. Get the project files into the session. If you only upload [`notebook.ipynb`](notebook.ipynb), run the **install** cell, then the **clone + verify** cell: it first looks for the required modules in the current directory, then under **`/kaggle/input/<dataset-name>/`** for any **Add data** dataset (read-only; the notebook `cd`s there), then `git clone`s the default public repo to `MissionCtrl/` under [`/kaggle/working`](https://www.kaggle.com/docs) when still missing. Alternatives:
+   - **Add data** — attach a dataset that contains `train.py` and the env modules; the verify cell will find them under `/kaggle/input/…`. **or**
+   - **Manually** `%cd /kaggle/working` and `!git clone <url>`, then `%cd` the repo. Private repos: use a **Kaggle dataset** with a checkout, or set `MISSIONCTRL_REPO_URL` in **Add-ons → Environment**.
+5. Open the first cells: run the **Install dependencies** cell, then the **clone + verify** cell, then **Verify GPU**. The clone + verify cell checks for `train.py`, `grpo_rewards.py`, `grpo_completion.py`, `environment.py`, and `reward_model.py`.
+6. Run a smoke job first, then a full run:
+   - `!python train.py --smoke-train` (short, no default Hub push when smoke is active), or
+   - `!python train.py` for the full curriculum, or use the **Run all** flow from the training cells in the notebook.
+7. **Checkpoints and plots:** on Kaggle, `train.py` uses `/kaggle/working/missionctrl_checkpoints` when the platform sets `KAGGLE_KERNEL_RUN_TYPE` or when `/kaggle/working` exists. Use **Save Version** / **Output** to keep artifacts, or rely on `push_to_hub` when you are not in a smoke run.
+
+#### Option B: Create a kernel and push with the Kaggle CLI
+
+1. On your **local** machine, install the CLI in a venv and authenticate (see [Local Kaggle CLI: install and token](#local-kaggle-cli-install-and-token) below). Verify with `kaggle competitions list -s titanic` or your usual online command.
+2. Create a **push directory** (not committed: `kaggle/missionctrl-kernel/` is in [.gitignore](.gitignore)). Example: `mkdir -p kaggle/missionctrl-kernel` from the project root, then from your clone, copy the files the kernel will run, for example:
+   - `cp notebook.ipynb kaggle/missionctrl-kernel/`
+   - If the notebook will **not** `git clone` a public URL inside Kaggle, also copy at least: `train.py`, `environment.py`, `reward_model.py`, `grpo_rewards.py` (and any other local files those import), into the same directory so `python train.py` and the notebook can resolve imports.
+3. **Kernel metadata:** from [kaggle/kernel-metadata.example.json](kaggle/kernel-metadata.example.json) copy to `kaggle/missionctrl-kernel/kernel-metadata.json` and set `id` to your slug `YourKaggleUsername/unique-kernel-name`, `title`, and `code_file` to the notebook name (e.g. `notebook.ipynb`). Alternatively run `kaggle kernels init -p kaggle/missionctrl-kernel` and merge the fields to match the [Kaggle kernel metadata spec](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md#contents). You must have `language` / `kernel_type` / `code_file` correct; set `"enable_internet": "true"`, `"enable_gpu": "true"`, and optional `dataset_sources` if the code is loaded from a Kaggle dataset instead of being copied in.
+4. **Push** from the repo (paths relative to the folder you pass to `-p`):
+   - `kaggle kernels push -p kaggle/missionctrl-kernel`
+5. Open the **kernel URL** the CLI prints. In **Settings**, set **2 × T4** and confirm **Internet** is on; **Save** / **Run** the notebook as you would in Option A.
+6. (Optional) After a successful run with the right settings: `kaggle kernels pull -k <username>/<kernel-slug> -p <dir> -m` to refresh `kernel-metadata.json` for the next `push` ([Kaggle kernels: pull with metadata](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels.md)).
+
+```mermaid
+flowchart LR
+  local[local_MissionCtrl]
+  bundle[kernel_push_folder]
+  push[kernels_push]
+  ui[Editor_Settings_2xT4]
+  train[run_train.py_or_notebook]
+  local -->|copy_or_git_clone| bundle
+  bundle --> push
+  push --> ui
+  ui --> train
+```
+
+#### Training run checklist (Options A and B)
+
+- [ ] Kaggle **Secret** `HF_TOKEN` attached; gated models accepted on HuggingFace.
+- [ ] `HF_REPO` in `train.py` is your real Hub id (not a placeholder).
+- [ ] Optional: run `python train.py --smoke-train` before a long run; see the **GRPO / LoRA training** table above for `MISSIONCTRL_MODEL_NAME`, `MISSIONCTRL_SMOKE_STEPS`, `MISSIONCTRL_DEVICE_MAP`, etc.
+- [ ] If two CUDA devices are visible, [`train.py`](train.py) uses a shorter curriculum and can use `device_map` model parallelism; `accelerate launch` multi-process DDP is not the default path in this project.
+
+#### API limits and troubleshooting
+
+- `enable_gpu` in metadata does not guarantee a specific **GPU type**; **2 × T4** is chosen in the **Kaggle web UI** when the option is not reflected after `push` ([kernels_metadata.md](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md) lists supported fields; accelerator-class selection has been a common limitation).
+- 2× T4 GRPO is **slow** compared to a single A100; wall time and session limits still apply.
+- OOM or driver issues: try `MISSIONCTRL_DEVICE_MAP=0` or a lower `MISSIONCTRL_LORA_RANK` (see the table above).
+- There is no Kaggle “job runner” in Cursor: training runs in the Kaggle **session** or a kernel you start from the site. Use the optional **Colab** tools in the [Colab, Kaggle, and Cursor](#colab-kaggle-and-cursor-user-colab-mcp) section if you work in Colab instead.
+
+#### Local Kaggle CLI: install and token
+
+Use the official CLI to **push** kernels, download datasets, and list competitions.
+
+- **Install** (isolated venv; on many distros the system Python is *externally managed* and cannot take global `pip` without flags):
+
+  ```bash
+  python3 -m venv .venv-cli
+  .venv-cli/bin/pip install -e ".[kaggle]"
+  ```
+
+- **Token:** the client reads, in order: the `KAGGLE_API_TOKEN` environment variable, or the full token in `~/.kaggle/access_token` (one line, `chmod 600`). The env value may be a literal token or a **path to a file** (see the [Kaggle access-token behavior](https://github.com/Kaggle/kaggle-api)). Do not commit API tokens. If a token is exposed, revoke it in [Kaggle account settings](https://www.kaggle.com/settings) and create a new one.
+- **Check:** `.venv-cli/bin/kaggle --version` prints a version. An online test such as `kaggle competitions list -s titanic` confirms authentication.
+- **Optional:** add `export KAGGLE_API_TOKEN=...` to `~/.zshrc` for a persistent env-based login; keep that out of the repo. A one-off `export` in the shell is fine for a single session.
 
 ### Configuration Notes
 
@@ -393,10 +475,11 @@ Hackathon and OpenEnv evaluators run **`inference.py` / `client.py` against your
 
 **Training-only environment variables (optional, e.g. Colab or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
 
-### Colab and Cursor (user-colab-mcp)
+### Colab, Kaggle, and Cursor (user-colab-mcp)
 
 - **Google Colab:** Run `notebook.ipynb` or `train.py` in Colab with a GPU runtime. The training script can persist checkpoints under Google Drive when `google.colab` is available.
-- **Cursor / MCP:** If the **user-colab-mcp** server is enabled, the `open_colab_browser_connection` tool opens a **browser connection to a Colab session** so you can edit the notebook from the IDE. It does not run training on its own; you still execute cells or `train.py` in Colab.
+- **Kaggle:** See **Kaggle training and Kaggle CLI** above. `notebook.ipynb` includes a Kaggle-specific section; checkpoints default to `/kaggle/working/missionctrl_checkpoints` on Kaggle.
+- **Cursor / MCP:** If the **user-colab-mcp** server is enabled, the `open_colab_browser_connection` tool opens a **browser connection to a Colab session** so you can edit the notebook from the IDE. It does not run training on its own; you still execute cells or `train.py` in Colab. Kaggle is not started via this MCP.
 
 ### Troubleshooting: Request Too Large / TPM Errors
 
