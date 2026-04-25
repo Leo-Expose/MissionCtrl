@@ -360,7 +360,7 @@ pytest tests/ -v
 
 #### GRPO / LoRA training (optional)
 
-Set these in the shell or Colab **before** running `train.py` (not read from `.env` by default):
+Set these in Kaggle **Add-ons → Environment** or in a shell **before** running `train.py` (not read from `.env` by default):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -442,7 +442,7 @@ flowchart LR
 - `enable_gpu` in metadata does not guarantee a specific **GPU type**; **2 × T4** is chosen in the **Kaggle web UI** when the option is not reflected after `push` ([kernels_metadata.md](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md) lists supported fields; accelerator-class selection has been a common limitation).
 - 2× T4 GRPO is **slow** compared to a single A100; wall time and session limits still apply.
 - OOM or driver issues: try `MISSIONCTRL_DEVICE_MAP=0` or a lower `MISSIONCTRL_LORA_RANK` (see the table above).
-- There is no Kaggle “job runner” in Cursor: training runs in the Kaggle **session** or a kernel you start from the site. Use the optional **Colab** tools in the [Colab, Kaggle, and Cursor](#colab-kaggle-and-cursor-user-colab-mcp) section if you work in Colab instead.
+- There is no Kaggle “job runner” in Cursor: training runs in the Kaggle **session** or a kernel you start from the site.
 
 #### Local Kaggle CLI: install and token
 
@@ -474,17 +474,16 @@ Hackathon and OpenEnv evaluators run **`inference.py` / `client.py` against your
 1. **Confirm the scoring model** — After `train.py` pushes a LoRA adapter to HuggingFace, point inference at a **router or provider** that can serve the **base** you trained (default 3B canary: `unsloth/Llama-3.2-3B-Instruct`, or 8B: `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` when you switch) **plus** that adapter. If you leave inference defaults (`openai/gpt-oss-120b`, Groq `llama-3.3-70b-versatile`, etc.), you are not evaluating the weights you trained.
 2. **Match base model ID** — Training defaults to the Unsloth 3B instruct checkpoint; run **8B** only by setting `MISSIONCTRL_MODEL_NAME` to `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` after the 3B canary. Your served `MODEL_NAME` and LoRA must match the **same** base you fine-tuned.
 3. **Reproduce before submit** — From the same repo: run the server, set `API_BASE_URL` / `MODEL_NAME` / `HF_TOKEN` in `.env` to the intended eval stack, then run `python client.py` or `python inference.py` and compare scores to a smoke run on a public baseline model.
-4. **HF Hub is adapter by default** — `train.py` calls `push_to_hub` for the PEFT/LoRA adapter. Consumers must load **base + adapter** (e.g. Unsloth/PEFT on Colab) unless you add a separate merge/publish step.
+4. **HF Hub is adapter by default** — `train.py` calls `push_to_hub` for the PEFT/LoRA adapter. Consumers must load **base + adapter** (for example with Unsloth/PEFT) unless you add a separate merge/publish step.
 
 **Workflow:** run a **full 3B** job with defaults first; when satisfied, re-run with `MISSIONCTRL_MODEL_NAME=unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit`. Optionally `python train.py --smoke-train` with the same 8B id to OOM-check before a long 8B run.
 
-**Training-only environment variables (optional, e.g. Colab or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
+**Training-only environment variables (optional, e.g. Kaggle Add-ons → Environment or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
 
-### Colab, Kaggle, and Cursor (user-colab-mcp)
+### Kaggle and Cursor
 
-- **Google Colab:** Run `notebook.ipynb` or `train.py` in Colab with a GPU runtime. The training script can persist checkpoints under Google Drive when `google.colab` is available.
-- **Kaggle:** See **Kaggle training and Kaggle CLI** above. `notebook.ipynb` includes a Kaggle-specific section; checkpoints default to `/kaggle/working/missionctrl_checkpoints` on Kaggle.
-- **Cursor / MCP:** If the **user-colab-mcp** server is enabled, the `open_colab_browser_connection` tool opens a **browser connection to a Colab session** so you can edit the notebook from the IDE. It does not run training on its own; you still execute cells or `train.py` in Colab. Kaggle is not started via this MCP.
+- **Kaggle:** See **Kaggle training and Kaggle CLI** above. `notebook.ipynb` targets Kaggle 2×T4; checkpoints default to `/kaggle/working/missionctrl_checkpoints` on Kaggle.
+- **Cursor:** Kaggle is not started from Cursor. Use Cursor to edit the repo/kernel files, then run training in the Kaggle browser session or pushed kernel.
 
 ### Troubleshooting: Request Too Large / TPM Errors
 

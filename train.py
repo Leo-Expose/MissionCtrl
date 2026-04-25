@@ -2,9 +2,9 @@
 MissionCtrl Training Script
 ============================
 GRPO fine-tuning with Unsloth on the MissionCtrl environment.
-Runs in Google Colab, Kaggle (2×T4), or a local GPU box.
+Runs in Kaggle (2×T4) or a local GPU box.
 
-Install (Colab / Kaggle notebook; adjust `unsloth[...]` per Unsloth if wheels fail):
+Install (Kaggle notebook; adjust `unsloth[...]` per Unsloth if wheels fail):
   !pip install "unsloth[colab-new]" trl openenv transformers datasets accelerate matplotlib
   !pip install --upgrade bitsandbytes
 
@@ -22,8 +22,8 @@ good, set `MISSIONCTRL_MODEL_NAME` to `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4b
 
 Method : GRPO (Group Relative Policy Optimization) via TRL
 
-Expected training time on A100: full 500 max_steps 3B run often ~1-1.5 h (not guaranteed);
-8B for the same curriculum often ~2-3 h. Phase repeats add time.
+Expected training time on 2×T4: full 350 max_steps 3B run often takes several hours.
+8B may exceed Kaggle session/runtime limits. Phase repeats add time.
 Expected reward curve: 0.28 to 0.75+ after 500 steps (stronger targets for the 8B run
 after 3B canary).
 
@@ -85,15 +85,14 @@ from reward_model import compute_reward, reward_breakdown
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Colab: Google Drive; Kaggle: writable /kaggle/working; else cwd-relative
-OUTPUT_DIR = "./missionctrl_checkpoints"
-try:
-    from google.colab import drive
-    drive.mount("/content/drive")
-    OUTPUT_DIR = "/content/drive/MyDrive/missionctrl_checkpoints"
-except ImportError:
-    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.isdir("/kaggle/working"):
-        OUTPUT_DIR = "/kaggle/working/missionctrl_checkpoints"
+# Kaggle: writable /kaggle/working; else cwd-relative. Do not mount external drives:
+# Kaggle images can include notebook compatibility stubs that fail at runtime.
+OUTPUT_DIR = os.environ.get(
+    "MISSIONCTRL_OUTPUT_DIR",
+    "/kaggle/working/missionctrl_checkpoints"
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.path.isdir("/kaggle/working")
+    else "./missionctrl_checkpoints",
+)
 
 # Kaggle-specific: load HF_TOKEN from secrets
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -139,7 +138,7 @@ try:
         NUM_GENERATIONS = 2  # FIX #2: must be ≤ BATCH_SIZE
         GRAD_ACCUM = 8
     else:
-        # Colab A100 or single GPU
+        # Single GPU / local fallback
         DEVICE_MAP = None
         BATCH_SIZE = 4
         NUM_GENERATIONS = 4  # FIX #2: must be ≤ BATCH_SIZE
@@ -161,7 +160,7 @@ try:
             {"difficulty": "hard",   "num_tasks": 4, "steps": 100, "min_reward": 0.65, "target": 0.72},
         ]
     else:
-        # Colab: full curriculum
+        # Single GPU / local fallback: full curriculum
         CURRICULUM = [
             {"difficulty": "easy",   "num_tasks": 3, "steps": 150, "min_reward": 0.50, "target": 0.55},
             {"difficulty": "medium", "num_tasks": 3, "steps": 200, "min_reward": 0.55, "target": 0.62},
@@ -176,7 +175,7 @@ except Exception:
     ]
 MAX_PHASE_REPEATS = 2   # repeat a phase up to this many times if threshold not met
 
-# Shorter curriculum for single low-VRAM GPU (e.g. Colab T4) — same idea as 2×GPU Kaggle table
+# Shorter curriculum for a single low-VRAM GPU — same idea as 2×GPU Kaggle table
 if os.environ.get("MISSIONCTRL_T4_CURRICULUM", "").strip().lower() in ("1", "true", "yes"):
     try:
         if not (torch.cuda.is_available() and torch.cuda.device_count() >= 2):
@@ -584,7 +583,7 @@ def _extract_log_reward(logs: dict) -> float | None:
 class FlatRewardEarlyStopCallback(TrainerCallback):
     """
     If easy-phase (curriculum index 0) reward stops moving after `min_step`, end the phase early.
-    Mitigates wasting Colab time on a noisy/flat GRPO signal (council guidance).
+    Mitigates wasting Kaggle runtime on a noisy/flat GRPO signal (council guidance).
     """
 
     def __init__(
