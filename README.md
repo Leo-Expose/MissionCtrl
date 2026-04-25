@@ -330,7 +330,7 @@ open http://localhost:8000/dashboard
 pip install -e ".[dev]"
 
 # Run server
-python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
+python -m uvicorn server.app:app --host 0.0.0.0 --port 7860
 
 # Configure API keys
 cp .env.example .env   # fill in your LLM provider keys
@@ -349,7 +349,7 @@ pytest tests/ -v
 | `API_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible LLM API endpoint |
 | `MODEL_NAME` | `openai/gpt-oss-120b` | Model to use |
 | `HF_TOKEN` | — | API key |
-| `ENV_BASE_URL` | `http://localhost:8000` | MissionCtrl server base URL |
+| `ENV_BASE_URL` | `http://localhost:7860` | MissionCtrl server base URL (same default port as Docker / `server.app`) |
 | `STEP_DELAY_S` | `4.0` | Delay between steps (reduce for speed) |
 | `VERBOSE_TRACE` | `1` | Show detailed step traces |
 | `PROMPT_PREVIEW_CHARS` | `200` | Prompt preview truncation length in trace logs |

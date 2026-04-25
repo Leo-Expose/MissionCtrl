@@ -99,7 +99,7 @@ class ResultRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    banner = r"""
+    banner = f"""
     ╔══════════════════════════════════════════════════════════════╗
     ║                                                              ║
     ║   🛡️  MissionCtrl  v1.0.0                                    ║
@@ -117,7 +117,7 @@ async def lifespan(_: FastAPI):
     ║   Tasks: easy, medium, hard, special                         ║
     ║                                                              ║
     ║   ┌──────────────────────────────────────────────────────┐   ║
-    ║   │  📊 Live Dashboard: http://localhost:8000/dashboard   │   ║
+    ║   │  📊 Live Dashboard: http://localhost:{_APP_PORT}/dashboard   │   ║
     ║   └──────────────────────────────────────────────────────┘   ║
     ║                                                              ║
     ╚══════════════════════════════════════════════════════════════╝
@@ -401,7 +401,7 @@ async def apple_touch_icon_precomposed():
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main(host: str = "0.0.0.0", port: int = 8000) -> None:
+def main(host: str = "0.0.0.0", port: int = 7860) -> None:
     import uvicorn
     uvicorn.run(app, host=host, port=port)
 

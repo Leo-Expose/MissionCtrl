@@ -22,7 +22,7 @@ def load_runtime_metadata() -> Dict[str, str]:
 
 def smoke_check(base_url: str | None = None, timeout_s: float = 10.0) -> Dict[str, Any]:
     """Validate that health-critical endpoints respond with HTTP 200."""
-    root = (base_url or os.getenv("ENV_BASE_URL", "http://127.0.0.1:8000")).rstrip("/")
+    root = (base_url or os.getenv("ENV_BASE_URL", "http://127.0.0.1:7860")).rstrip("/")
     endpoints = ["/", "/health", "/state", "/logs"]
     results: Dict[str, Any] = {"base_url": root, "ok": True, "checks": []}
 
