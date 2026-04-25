@@ -448,7 +448,10 @@ class MissionCtrlEngine:
         self.time_step: int = 0
         self.done: bool = False
         self.seed: int = 42
-        self._injected_ids: Set[str] = set()
+        self._injector: Optional[HallucinationInjector] = None
+        self._gen_seq: int = 0
+        self._injected_ids: Set[str] = set()  # ids with active corrupted output (hallucination_type set)
+        self._ever_injected_ids: Set[str] = set()  # any injection this episode (detection denominator)
         self._flagged_ids: Set[str] = set()
         self._flag_results: Dict[str, str] = {}  # task_id -> "TP" or "FP"
         self._redelegate_log: List[Dict[str, Any]] = []
@@ -466,11 +469,13 @@ class MissionCtrlEngine:
         self.time_step = 0
         self.done = False
         self._injected_ids = set()
+        self._ever_injected_ids = set()
         self._flagged_ids = set()
         self._flag_results = {}
         self._redelegate_log = []
         self._action_log = []
         self._all_actions = []
+        self._gen_seq = 0
 
         cfg = DIFFICULTY_CONFIG[task_id]
         rng = random.Random(self.seed)
@@ -480,29 +485,23 @@ class MissionCtrlEngine:
         task_bank_map = {t["id"]: t for t in TASK_BANK}
         selected_ids = rng.sample(tier_tasks, min(cfg["num_tasks"], len(tier_tasks)))
 
+        self._injector = HallucinationInjector(cfg["injection_rate"], cfg["subtlety"], seed=self.seed + 1000)
+
         self.tasks = []
         for tid in selected_ids:
             t = task_bank_map[tid]
-            agent = AGENTS[t["agent"]]
-            output = rng.choice(agent.output_templates)
             task = Task(
                 id=tid,
                 title=t["title"],
                 description=t["desc"],
                 assigned_agent=t["agent"],
                 dependencies=[d for d in t["deps"] if d in selected_ids],
-                status="IN_PROGRESS",
-                output=output,
+                status="PENDING",
+                output="",
             )
             self.tasks.append(task)
 
-        # Inject hallucinations
-        injector = HallucinationInjector(cfg["injection_rate"], cfg["subtlety"], seed=self.seed + 1000)
-        for task in self.tasks:
-            result = injector.maybe_inject(task)
-            if result:
-                self._injected_ids.add(task.id)
-
+        self._generate_ready()
         return self._build_observation()
 
     def step(self, action_string: str) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
@@ -583,22 +582,22 @@ class MissionCtrlEngine:
         correct = 0.0
         for t in self.tasks:
             if t.status == "DONE":
-                # If hallucinated and was approved WITHOUT being flagged first = miss
-                if t.id in self._injected_ids and not t.was_flagged:
+                # If output still corrupted and was approved WITHOUT being flagged first = miss
+                if t.hallucination_type is not None and not t.was_flagged:
                     continue  # zero contribution
                 correct += 1.0
                 continue
 
-            if t.id in self._injected_ids and t.was_flagged:
+            if t.hallucination_type is not None and t.was_flagged:
                 correct += PARTIAL_FLAG_TASK_CREDIT
         return correct / len(self.tasks)
 
     def _signal_hallucination_detection(self) -> float:
         """Signal 2: True positive rate (30%)."""
-        if not self._injected_ids:
+        if not self._ever_injected_ids:
             return 1.0  # no hallucinations to detect = perfect
-        caught = self._injected_ids & self._flagged_ids
-        return len(caught) / len(self._injected_ids)
+        caught = self._ever_injected_ids & self._flagged_ids
+        return len(caught) / len(self._ever_injected_ids)
 
     def _signal_false_positive_penalty(self) -> float:
         """Signal 3: False positive flag rate (-15%).
@@ -608,7 +607,7 @@ class MissionCtrlEngine:
         total_flags = len(self._flag_results)
         if total_flags == 0:
             # Passive penalty when hallucinations exist but nothing flagged
-            if self._injected_ids and self.difficulty != "easy":
+            if self._ever_injected_ids and self.difficulty != "easy":
                 return 0.4
             return 0.0
 
@@ -702,38 +701,38 @@ class MissionCtrlEngine:
         """APPROVE: Set task → DONE."""
         if task.status == "DONE":
             return -0.5  # already done
+        if task.status != "IN_PROGRESS":
+            return -0.5  # no output yet (PENDING) or terminal BLOCKED
+        if not task.output.strip():
+            return -0.5
         task.status = "DONE"
-        if task.id in self._injected_ids and not task.was_flagged:
+        if task.hallucination_type is not None and not task.was_flagged:
             return -2.0  # approved a hallucinated task without flagging
         return 1.0
 
     def _handle_reject(self, task: Task, reason: str) -> float:
-        """REJECT: Reset task → PENDING, clear output."""
-        task.status = "PENDING"
-        task.output = ""
+        """REJECT: Reset task → PENDING, clear output and corruption state."""
+        self._strip_task_to_pending(task)
         return 0.0  # neutral — rejection is cautious but not directly rewarded
 
     def _handle_redelegate(self, task: Task, agent_name: str) -> float:
-        """REDELEGATE: Reassign to new agent, reset output."""
+        """REDELEGATE: Reassign to new agent; regen goes through _generate_ready()."""
         if agent_name not in AGENTS:
             return -0.5  # invalid agent
 
         same_agent = (agent_name == task.assigned_agent)
         circular = len(task.redelegate_history) >= 2
 
-        task.redelegate_history.append(task.assigned_agent)
+        from_agent = task.assigned_agent
+        task.redelegate_history.append(from_agent)
         task.assigned_agent = agent_name
 
-        # Generate new output from the new agent
-        rng = random.Random(self.seed + self.time_step)
-        new_agent = AGENTS[agent_name]
-        task.output = rng.choice(new_agent.output_templates)
-        task.status = "IN_PROGRESS"
+        self._strip_task_to_pending(task)
 
         effective = not same_agent and not circular
         self._redelegate_log.append({
             "task_id": task.id,
-            "from_agent": task.redelegate_history[-1] if task.redelegate_history else "",
+            "from_agent": from_agent,
             "to_agent": agent_name,
             "same_agent": same_agent,
             "circular": circular,
@@ -756,7 +755,7 @@ class MissionCtrlEngine:
         task.flag_evidence = evidence
         self._flagged_ids.add(task.id)
 
-        if task.id in self._injected_ids:
+        if task.hallucination_type is not None:
             self._flag_results[task.id] = "TP"
             return 2.0  # true positive — caught a real hallucination
         else:
@@ -769,8 +768,11 @@ class MissionCtrlEngine:
         return -0.2  # small penalty — escalation is cautious but delays progress
 
     def _handle_synthesize(self) -> float:
-        """SYNTHESIZE_REPORT: Mark remaining tasks DONE — only if all hallucinations caught."""
-        uncaught = self._injected_ids - self._flagged_ids
+        """SYNTHESIZE_REPORT: Mark remaining tasks DONE — only if all current corruptions flagged."""
+        uncaught = any(
+            t.hallucination_type is not None and not t.was_flagged
+            for t in self.tasks
+        )
         if uncaught:
             return -3.0  # penalty for premature synthesis with uncaught hallucinations
 
@@ -790,13 +792,43 @@ class MissionCtrlEngine:
                 return t
         return None
 
+    def _strip_task_to_pending(self, task: Task) -> None:
+        """Clear output/corruption/flag state and set PENDING for reject/redelegate."""
+        self._injected_ids.discard(task.id)
+        task.status = "PENDING"
+        task.output = ""
+        task.hallucination_type = None
+        task.was_flagged = False
+        task.flag_evidence = ""
+        self._flagged_ids.discard(task.id)
+        self._flag_results.pop(task.id, None)
+
+    def _fill_task_output(self, task: Task) -> None:
+        """Set IN_PROGRESS output from templates and apply hallucination injector."""
+        if self._injector is None:
+            return
+        self._gen_seq += 1
+        self._injected_ids.discard(task.id)
+        task.hallucination_type = None
+        salt = sum(ord(c) for c in task.id)
+        rng = random.Random(self.seed + self._gen_seq * 100_003 + salt)
+        agent = AGENTS[task.assigned_agent]
+        task.output = rng.choice(agent.output_templates)
+        task.status = "IN_PROGRESS"
+        result = self._injector.maybe_inject(task)
+        if result:
+            self._injected_ids.add(task.id)
+            self._ever_injected_ids.add(task.id)
+
     def _generate_ready(self) -> None:
-        """Unlock dependency-gated tasks."""
+        """Promote PENDING tasks whose deps are DONE; generate output and maybe inject."""
         done_ids = {t.id for t in self.tasks if t.status == "DONE"}
         for t in self.tasks:
-            if t.status == "PENDING" and t.dependencies:
-                if all(d in done_ids for d in t.dependencies):
-                    t.status = "IN_PROGRESS"
+            if t.status != "PENDING":
+                continue
+            if not all(d in done_ids for d in t.dependencies):
+                continue
+            self._fill_task_output(t)
 
     def _check_termination(self) -> bool:
         """Check if all tasks are in terminal state."""
@@ -822,10 +854,10 @@ class MissionCtrlEngine:
             "max_steps": MAX_STEPS,
             "tasks": tasks_obs,
             "done": self.done,
-            "num_injected": len(self._injected_ids),  # visible count, not IDs
+            "num_injected": len(self._injected_ids),  # currently corrupted outputs
             "hallucination_stats": {
-                "total_injected": len(self._injected_ids),
-                "total_caught": len(self._injected_ids & self._flagged_ids),
+                "total_injected": len(self._ever_injected_ids),
+                "total_caught": len(self._ever_injected_ids & self._flagged_ids),
                 "total_flags": len(self._flag_results),
                 "true_positives": sum(1 for v in self._flag_results.values() if v == "TP"),
                 "false_positives": sum(1 for v in self._flag_results.values() if v == "FP"),
@@ -854,8 +886,8 @@ class MissionCtrlEngine:
                 "llm_judge_quality":       {"value": round(s5, 4), "weight": 0.10, "contribution": round(0.10 * s5, 4)},
             },
             "hallucination_stats": {
-                "total_injected": len(self._injected_ids),
-                "total_caught": len(self._injected_ids & self._flagged_ids),
+                "total_injected": len(self._ever_injected_ids),
+                "total_caught": len(self._ever_injected_ids & self._flagged_ids),
                 "total_flags": len(self._flag_results),
                 "true_positives": sum(1 for v in self._flag_results.values() if v == "TP"),
                 "false_positives": sum(1 for v in self._flag_results.values() if v == "FP"),
@@ -876,7 +908,11 @@ class MissionCtrlEngine:
             flag = "🚩" if t.was_flagged else "  "
             hall = f" [HALL:{t.hallucination_type}]" if t.hallucination_type else ""
             lines.append(f"  {flag} {t.id}: [{t.status:12s}] {t.title} → {t.assigned_agent}{hall}")
-        lines.append(f"  Injected: {len(self._injected_ids)} | Caught: {len(self._injected_ids & self._flagged_ids)} | FP: {sum(1 for v in self._flag_results.values() if v == 'FP')}")
+        lines.append(
+            f"  Injected(now): {len(self._injected_ids)} | Ever: {len(self._ever_injected_ids)} | "
+            f"Caught: {len(self._ever_injected_ids & self._flagged_ids)} | "
+            f"FP: {sum(1 for v in self._flag_results.values() if v == 'FP')}"
+        )
         return "\n".join(lines)
 
 
