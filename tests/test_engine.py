@@ -15,6 +15,19 @@ from server.environment import (
 )
 
 
+def _approve_until_all_done(env: MissionCtrlEngine, max_steps: int = 80) -> None:
+    """Approve tasks that have output, in dependency-safe order (each step unlocks children)."""
+    steps = 0
+    while not env.done and steps < max_steps:
+        steps += 1
+        ready = [t for t in env.tasks if t.status == "IN_PROGRESS" and t.output.strip()]
+        if ready:
+            env.step(f"APPROVE({ready[0].id})")
+        else:
+            env.step("NOOP")
+    assert env.done, "expected episode to finish via APPROVE / NOOP"
+
+
 class TestScoreClamping:
     """All scores must be strictly in (0, 1) — never 0.0 or 1.0."""
 
@@ -109,6 +122,17 @@ class TestEngineReset:
         assert "tasks" in obs
         assert "difficulty" in obs
         assert obs["done"] is False
+        done_ids = {t["task_id"] for t in obs["tasks"] if t["status"] == "DONE"}
+        for row in obs["tasks"]:
+            tid = row["task_id"]
+            deps = row.get("dependencies") or []
+            blocked = any(d not in done_ids for d in deps)
+            if not blocked:
+                assert row["status"] == "IN_PROGRESS", tid
+                assert row["output"].strip(), tid
+            else:
+                assert row["status"] == "PENDING", tid
+                assert row["output"] == "", tid
 
     def test_reset_tasks_match_tier(self):
         for tier in ["easy", "medium", "hard", "special"]:
@@ -120,7 +144,8 @@ class TestEngineReset:
     def test_reset_clears_state(self):
         env = MissionCtrlEngine()
         env.reset("easy", seed=42)
-        env.step('APPROVE(task_01)')
+        tid = env.tasks[0].id
+        env.step(f"APPROVE({tid})")
         env.reset("medium", seed=99)
         assert env.time_step == 0
         assert not env._flagged_ids
@@ -144,15 +169,13 @@ class TestHallucinationInjection:
     def test_easy_has_fewer_injections(self):
         env_easy = MissionCtrlEngine()
         env_hard = MissionCtrlEngine()
-        easy_total = sum(len(env_easy.reset("easy", seed=s) and [] or []) or len(env_easy._injected_ids) for s in range(50))
-        # Hacky but works — reset returns obs, we just want _injected_ids count
         easy_count = 0
         hard_count = 0
         for s in range(50):
             env_easy.reset("easy", seed=s)
-            easy_count += len(env_easy._injected_ids)
+            easy_count += len(env_easy._ever_injected_ids)
             env_hard.reset("hard", seed=s)
-            hard_count += len(env_hard._injected_ids)
+            hard_count += len(env_hard._ever_injected_ids)
         assert easy_count < hard_count
 
 
@@ -166,13 +189,15 @@ class TestActionMechanics:
         env.step(f"APPROVE({task_id})")
         assert env.tasks[0].status == "DONE"
 
-    def test_reject_resets_to_pending(self):
+    def test_reject_then_regenerates_same_step(self):
         env = MissionCtrlEngine()
         env.reset("easy", seed=42)
         task_id = env.tasks[0].id
         env.step(f'REJECT({task_id}, "bad quality")')
-        assert env.tasks[0].status == "PENDING"
-        assert env.tasks[0].output == ""
+        t = next(x for x in env.tasks if x.id == task_id)
+        assert t.status == "IN_PROGRESS"
+        assert t.output.strip() != ""
+        assert t.hallucination_type is None or t.hallucination_type in HALLUCINATION_TYPES
 
     def test_flag_true_positive(self):
         """Flagging an injected task should be TP."""
@@ -192,7 +217,7 @@ class TestActionMechanics:
         """Flagging a clean task should be FP."""
         env = MissionCtrlEngine()
         env.reset("easy", seed=42)
-        clean_ids = [t.id for t in env.tasks if t.id not in env._injected_ids]
+        clean_ids = [t.id for t in env.tasks if t.hallucination_type is None]
         if clean_ids:
             _, reward, _, _ = env.step(f'FLAG({clean_ids[0]}, "suspected issue")')
             assert reward < 0, "False positive should give negative reward"
@@ -269,7 +294,7 @@ class TestEasyDifficultyPenaltyGate:
         env = MissionCtrlEngine()
         for seed in range(100):
             env.reset("hard", seed=seed)
-            if env._injected_ids:
+            if env._ever_injected_ids:
                 # Don't flag anything — should get passive penalty on hard
                 fp_signal = env._signal_false_positive_penalty()
                 assert fp_signal == 0.4, f"Hard should have passive penalty, got {fp_signal}"
@@ -282,8 +307,7 @@ class TestEpisodeBoundaries:
     def test_episode_ends_when_all_tasks_done(self):
         env = MissionCtrlEngine()
         env.reset("easy", seed=42)
-        for t in env.tasks:
-            env.step(f"APPROVE({t.id})")
+        _approve_until_all_done(env)
         assert env.done
 
     def test_episode_ends_at_max_steps(self):
@@ -309,7 +333,7 @@ class TestRewardSignals:
         env = MissionCtrlEngine()
         env.reset("easy", seed=42)
         for t in env.tasks:
-            if t.id in env._injected_ids:
+            if t.hallucination_type is not None:
                 # Flag first, then approve
                 env.step(f'FLAG({t.id}, "hallucination detected")')
             env.step(f"APPROVE({t.id})")
@@ -338,8 +362,8 @@ class TestRewardSignals:
         env = MissionCtrlEngine()
         for seed in range(100):
             env.reset("hard", seed=seed)
-            if env._injected_ids:
-                for iid in env._injected_ids:
+            if env._ever_injected_ids:
+                for iid in list(env._ever_injected_ids):
                     env.step(f'FLAG({iid}, "detected")')
                 dr = env._signal_hallucination_detection()
                 assert dr == 1.0
@@ -349,4 +373,144 @@ class TestRewardSignals:
         """When no hallucinations exist, detection rate = 1.0."""
         env = MissionCtrlEngine()
         env._injected_ids = set()
+        env._ever_injected_ids = set()
         assert env._signal_hallucination_detection() == 1.0
+
+
+class TestDependencyUnlock:
+    """Dependency-gated outputs and unlock ordering."""
+
+    def test_roots_in_progress_after_reset(self):
+        env = MissionCtrlEngine()
+        env.reset("easy", seed=42)
+        for t in env.tasks:
+            if not t.dependencies:
+                assert t.status == "IN_PROGRESS"
+                assert t.output.strip()
+
+    def test_pruned_dependency_outside_sample_unlocks_at_reset(self):
+        """Deps pointing outside the sampled set are dropped — task is a root."""
+        for seed in range(300):
+            env = MissionCtrlEngine()
+            env.reset("medium", seed=seed)
+            ids = {t.id for t in env.tasks}
+            if "task_07" in ids and "task_06" not in ids:
+                t7 = next(t for t in env.tasks if t.id == "task_07")
+                assert t7.dependencies == []
+                assert t7.status == "IN_PROGRESS"
+                assert t7.output.strip()
+                return
+        raise AssertionError("no seed with task_07 without task_06 in 300 tries")
+
+    def test_chain_unlocks_only_after_parents_done(self):
+        for seed in range(500):
+            env = MissionCtrlEngine()
+            env.reset("medium", seed=seed)
+            ids = {t.id for t in env.tasks}
+            if {"task_06", "task_07", "task_08"}.issubset(ids):
+                t6 = next(t for t in env.tasks if t.id == "task_06")
+                t7 = next(t for t in env.tasks if t.id == "task_07")
+                t8 = next(t for t in env.tasks if t.id == "task_08")
+                assert t6.status == "IN_PROGRESS" and t6.output
+                assert t7.status == "PENDING" and t7.output == ""
+                assert t8.status == "PENDING" and t8.output == ""
+                env.step("APPROVE(task_06)")
+                t7 = next(t for t in env.tasks if t.id == "task_07")
+                t8 = next(t for t in env.tasks if t.id == "task_08")
+                assert t7.status == "IN_PROGRESS" and t7.output
+                assert t8.status == "PENDING" and t8.output == ""
+                env.step("APPROVE(task_07)")
+                t8 = next(t for t in env.tasks if t.id == "task_08")
+                assert t8.status == "IN_PROGRESS" and t8.output.strip()
+                return
+        raise AssertionError("no medium seed with task_06,07,08 in 500 tries")
+
+
+class TestRegenerationHallucination:
+    """Reject / redelegate clears corruption metadata and regen path."""
+
+    def test_approve_after_redelegate_clean_has_no_hall_penalty(self):
+        for seed in range(200):
+            env = MissionCtrlEngine()
+            env.reset("hard", seed=seed)
+            injected = [t for t in env.tasks if t.hallucination_type is not None]
+            if not injected:
+                continue
+            t = injected[0]
+            alt = next(a for a in AGENTS if a != t.assigned_agent)
+            env.step(f"REDELEGATE({t.id}, {alt})")
+            t2 = next(x for x in env.tasks if x.id == t.id)
+            if t2.hallucination_type is not None:
+                continue
+            _, r, _, _ = env.step(f"APPROVE({t.id})")
+            assert r == 1.0
+            return
+        raise AssertionError("no suitable seed for clean redelegate")
+
+    def test_redelegate_invalid_agent_no_mutation(self):
+        env = MissionCtrlEngine()
+        env.reset("easy", seed=42)
+        t0 = env.tasks[0]
+        before = (t0.status, t0.output, t0.assigned_agent)
+        _, r, _, _ = env.step(f"REDELEGATE({t0.id}, NonexistentAgent)")
+        assert r == -0.5
+        assert (t0.status, t0.output, t0.assigned_agent) == before
+
+
+class TestSynthesizeEdgeCases:
+    """SYNTHESIZE_REPORT gating on current corruption."""
+
+    def test_synthesize_allowed_when_no_active_hallucination(self):
+        for seed in range(80):
+            env = MissionCtrlEngine()
+            env.reset("easy", seed=seed)
+            if env._injected_ids:
+                continue
+            _, reward, done, _ = env.step("SYNTHESIZE_REPORT()")
+            assert reward > 0
+            assert done
+            return
+        raise AssertionError("no easy seed without injection in 80 tries")
+
+    def test_synthesize_penalized_when_hall_uncaught(self):
+        env = MissionCtrlEngine()
+        for seed in range(100):
+            env.reset("hard", seed=seed)
+            if env._injected_ids:
+                _, reward, _, _ = env.step("SYNTHESIZE_REPORT()")
+                assert reward < 0
+                return
+        raise AssertionError("No injection found in 100 seeds")
+
+
+class TestInvalidActions:
+    """Invalid task ids and illegal approve targets."""
+
+    def test_approve_unknown_task_negative_reward(self):
+        env = MissionCtrlEngine()
+        env.reset("easy", seed=42)
+        _, r, _, _ = env.step("APPROVE(task_nonexistent)")
+        assert r == -1.0
+
+    def test_approve_pending_child_negative_reward(self):
+        for seed in range(500):
+            env = MissionCtrlEngine()
+            env.reset("medium", seed=seed)
+            ids = {t.id for t in env.tasks}
+            if {"task_06", "task_07"}.issubset(ids):
+                _, r, _, _ = env.step("APPROVE(task_07)")
+                assert r == -0.5
+                return
+        raise AssertionError("no suitable medium seed")
+
+
+class TestMissionCtrlEnvironmentWrapper:
+    """HTTP wrapper contract."""
+
+    def test_reset_step_payload_keys(self):
+        env = MissionCtrlEnvironment()
+        out = env.reset("easy", seed=1)
+        assert set(out.keys()) == {"observation", "done"}
+        assert "tasks" in out["observation"]
+        step_out = env.step("NOOP")
+        assert set(step_out.keys()) == {"observation", "reward", "done", "info"}
