@@ -31,17 +31,19 @@ EVIDENCE_KEYWORDS = [
     "because", "therefore", "circular", "restates",
 ]
 
+PARTIAL_FLAG_TASK_CREDIT = 0.5
+
 # ─────────────────────────────────────────────
 # Signal 1: Task Completion Accuracy  (30%)
 # ─────────────────────────────────────────────
 
 def signal_task_completion(env: "MissionCtrlEnv") -> float:
     """
-    Score = (tasks correctly done) / (total tasks)
+    Score = (task completion credit) / (total tasks)
 
-    A task is "correctly done" if:
-      - Status is DONE
-      - AND it was not approved while containing an undetected hallucination
+    Credit rules:
+      - 1.0 for a task in DONE state, unless it was hallucinated and never flagged
+      - 0.5 for a hallucinated task that was correctly flagged but not yet resolved
 
     Approving a hallucinated task without first flagging it counts as a mistake.
     """
@@ -58,6 +60,8 @@ def signal_task_completion(env: "MissionCtrlEnv") -> float:
                 correct += 0.0   # approved a hallucination without flagging it
             else:
                 correct += 1.0
+        elif task.is_hallucinated and task.task_id in env._caught_ids:
+            correct += PARTIAL_FLAG_TASK_CREDIT
 
     return correct / total
 

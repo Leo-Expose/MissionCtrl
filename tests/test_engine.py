@@ -197,6 +197,20 @@ class TestActionMechanics:
             _, reward, _, _ = env.step(f'FLAG({clean_ids[0]}, "suspected issue")')
             assert reward < 0, "False positive should give negative reward"
 
+    def test_duplicate_flag_does_not_award_true_positive_again(self):
+        """Repeated FLAG on the same task should not farm positive reward."""
+        env = MissionCtrlEngine()
+        for seed in range(100):
+            env.reset("hard", seed=seed)
+            if env._injected_ids:
+                injected_id = list(env._injected_ids)[0]
+                _, first_reward, _, _ = env.step(f'FLAG({injected_id}, "detected hallucination")')
+                _, second_reward, _, _ = env.step(f'FLAG({injected_id}, "detected hallucination")')
+                assert first_reward > 0, "Initial true positive should be rewarded"
+                assert second_reward <= 0, "Duplicate FLAG should not be rewarded again"
+                return
+        assert False, "No injection found in 100 seeds"
+
     def test_escalate_blocks_task(self):
         env = MissionCtrlEngine()
         env.reset("easy", seed=42)
@@ -301,6 +315,24 @@ class TestRewardSignals:
             env.step(f"APPROVE({t.id})")
         score = env._signal_task_completion()
         assert score == 1.0
+
+    def test_task_completion_gives_partial_credit_for_true_positive_flag(self):
+        env = MissionCtrlEngine()
+        for seed in range(100):
+            env.reset("hard", seed=seed)
+            if env._injected_ids:
+                injected_id = sorted(env._injected_ids)[0]
+                env.step(f'FLAG({injected_id}, "detected")')
+                score = env._signal_task_completion()
+                assert score == 0.5 / len(env.tasks)
+                return
+        assert False, "No injection found in 100 seeds"
+
+    def test_task_completion_does_not_give_partial_credit_for_clean_unfinished_task(self):
+        env = MissionCtrlEngine()
+        env.reset("easy", seed=42)
+        score = env._signal_task_completion()
+        assert score == 0.0
 
     def test_hallucination_detection_perfect(self):
         env = MissionCtrlEngine()
