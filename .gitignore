@@ -12,3 +12,4 @@ reward_curve.png
 .codex
 AGENTS.md
 graphify-out
+.cursor/debug-*.log
