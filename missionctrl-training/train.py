@@ -67,6 +67,7 @@ LEARNING_RATE   = 2e-5
 NUM_GENERATIONS = 4                             # GRPO: samples per prompt
 SAVE_STEPS      = 50
 HF_REPO         = "Proliferation/missionctrl"  # set before push
+RESUME_FROM_CHECKPOINT = None  # Set to path to resume training (e.g., "./missionctrl_checkpoints/phase_1_attempt_1/checkpoint-100")
 
 # Validate HF_REPO is not placeholder
 assert "your-hf" not in HF_REPO, "Please set your actual HF username in HF_REPO"
@@ -118,6 +119,7 @@ except:
         {"difficulty": "hard",   "num_tasks": 4, "steps": 150, "min_reward": 0.75, "target": 0.80},
     ]
 MAX_PHASE_REPEATS = 2   # repeat a phase up to this many times if threshold not met
+EARLY_STOP_PATIENCE = 3  # stop if reward doesn't improve for N evaluations
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
@@ -477,11 +479,25 @@ def run_baseline() -> float:
 # ── Training Loop with Curriculum Gating ─────────────────────────────────────
 
 def train():
+    # Detect platform for logging
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.get_device_count()
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"🖥️  Platform: {'Kaggle' if gpu_count >= 2 else 'Colab/Local'}")
+            print(f"🎮 GPU: {gpu_name} x{gpu_count}")
+            print(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    except:
+        print("🖥️  Platform: Unknown")
+
     print("🚀 Loading model...")
     model, tokenizer = load_model()
     tokenizer.pad_token = tokenizer.eos_token
 
     all_rewards_history = []
+    best_reward = 0.0
+    patience_counter = 0
 
     for phase_idx, phase in enumerate(CURRICULUM):
         phase_attempts = 0
@@ -521,6 +537,7 @@ def train():
                 save_steps                  = SAVE_STEPS,
                 report_to                   = "tensorboard",
                 seed                        = 42,
+                max_grad_norm               = 1.0,  # Gradient clipping for stability
             )
 
             trainer = GRPOTrainer(
@@ -554,11 +571,30 @@ def train():
                     f"\n  ✅ Phase {phase_idx + 1} PASSED | "
                     f"reward={avg_reward:.3f} ≥ threshold={phase['min_reward']:.2f}"
                 )
+                # Reset patience on success
+                patience_counter = 0
             else:
                 print(
                     f"\n  ⚠️  Phase {phase_idx + 1} threshold not met: "
                     f"{avg_reward:.3f} < {phase['min_reward']:.2f}"
                 )
+                # Early stopping check
+                if avg_reward > best_reward:
+                    best_reward = avg_reward
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    print(f"     Reward hasn't improved for {patience_counter} evaluations")
+                    if patience_counter >= EARLY_STOP_PATIENCE:
+                        print(f"     🛑 Early stopping triggered (patience={EARLY_STOP_PATIENCE})")
+                        all_rewards_history.append({
+                            "phase":      phase_idx + 1,
+                            "difficulty": phase["difficulty"],
+                            "avg_reward": avg_reward,
+                            "metrics":    metrics,
+                            "attempts":   phase_attempts,
+                        })
+                        break
                 if phase_attempts <= MAX_PHASE_REPEATS:
                     print(f"     Repeating phase...")
                 else:
