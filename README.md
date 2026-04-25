@@ -386,6 +386,10 @@ Training on Kaggle can be done **only in the browser** or with the **official [K
 - Local machine (for **Option B** only): a working [Kaggle CLI](https://github.com/Kaggle/kaggle-api) and auth (see [Local Kaggle CLI: install and token](#local-kaggle-cli-install-and-token) at the end of this section). Official metadata fields are [documented here](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md#contents).
 - In [`train.py`](train.py), set a real `HF_REPO` and **do not commit** your HuggingFace or Kaggle API tokens in the repository.
 
+#### Troubleshooting
+
+- **`Directory 'MissionCtrl' exists but is incomplete`:** The clone + verify cell found a `MissionCtrl` folder that is missing one or more of the required modules (`train.py`, `grpo_rewards.py`, `grpo_completion.py`, etc.). Delete that folder in the Kaggle file browser (or run `!rm -rf MissionCtrl` after `%cd /kaggle/working`), then re-run the cell; or set `MISSIONCTRL_REPO_URL` to a full repository; or use **Add data** with a dataset that contains a complete checkout.
+
 #### Option A: Kaggle.com only (import the notebook, run training)
 
 1. Open **Kaggle** → **Code** → **New notebook**.
