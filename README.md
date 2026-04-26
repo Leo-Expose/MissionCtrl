@@ -346,9 +346,10 @@ pytest tests/ -v
 
 | Variable | Default | Description |
 |---|---|---|
-| `API_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible LLM API endpoint |
-| `MODEL_NAME` | `openai/gpt-oss-120b` | Model to use |
-| `HF_TOKEN` | — | API key |
+| `API_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible LLM API endpoint (must include `/v1` for hosts that expose `…/v1/chat/completions`) |
+| `MODEL_NAME` | `openai/gpt-oss-120b` | Model id **as expected by that host** (router catalog, provider deployment, etc.). Training’s `MISSIONCTRL_MODEL_NAME` does **not** override this automatically. |
+| `HF_TOKEN` | — | API key passed to the OpenAI client (`hf_…` on Hugging Face, `gsk_…` on Groq, etc.) |
+| `MISSIONCTRL_HF_LLM_STRATEGY` | `chat_first` | For **HF dedicated** endpoints only: `chat_first` (OpenAI chat, then optional native `inputs` fallback) or `native_only` (skip chat; use classic generation on the endpoint root). |
 | `ENV_BASE_URL` | `http://localhost:7860` | MissionCtrl server base URL (same default port as Docker / `server.app`) |
 | `STEP_DELAY_S` | `4.0` | Delay between steps (reduce for speed) |
 | `VERBOSE_TRACE` | `1` | Show detailed step traces |
@@ -364,7 +365,7 @@ Set these in Kaggle **Add-ons → Environment** or in a shell **before** running
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MISSIONCTRL_MODEL_NAME` | `unsloth/Llama-3.2-3B-Instruct` | Unsloth QLoRA base. Default is **3B** for a full canary; after that succeeds, set to `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` for 8B. Gated models may need `HF_TOKEN` and license acceptance. |
+| `MISSIONCTRL_MODEL_NAME` | `Qwen/Qwen2.5-0.5B-Instruct` | Unsloth QLoRA base. Default is **Qwen2.5 0.5B Instruct** (fast canary). For a larger model, set e.g. `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` or `unsloth/Llama-3.2-3B-Instruct`. Gated hubs may need `HF_TOKEN` and license acceptance. |
 | `MISSIONCTRL_LORA_RANK` | `16` | LoRA rank. Council guidance: start at 16; try `32` if a baseline run plateaus. |
 | `MISSIONCTRL_EARLY_STOP_PHASE1` | `1` | If set to `1`, enables early stop when phase 1 (easy) reward is flat after a minimum step count. |
 | `MISSIONCTRL_EARLY_STOP_MIN_STEPS` | `75` | Minimum training steps in phase 1 before the flat-reward check applies. |
@@ -464,21 +465,26 @@ Use the official CLI to **push** kernels, download datasets, and list competitio
 ### Configuration Notes
 
 **Inference vs Training:**
-- The `.env.example` file configures the **inference server** (FastAPI + external LLM API via `API_BASE_URL` and `MODEL_NAME`)
-- The `train.py` script uses **local Unsloth** for GRPO fine-tuning (separate stack from inference)
-- For training, you only need to set `HF_REPO` in `train.py` and authenticate with HuggingFace
-- For inference, configure `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` in `.env`
+- The `.env` / `.env.example` variables `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` configure the **LLM client** used by [`client.py`](client.py) and [`inference.py`](inference.py). The FastAPI app under [`server/`](server/) serves the MissionCtrl environment over HTTP; it does **not** read those LLM variables unless you add wiring yourself.
+- The `train.py` script uses **local Unsloth** for GRPO fine-tuning (separate stack from inference).
+- For training, you set `HF_REPO` in `train.py` and authenticate with HuggingFace (e.g. `HF_TOKEN` in the shell or Kaggle Secrets).
+- For inference, set `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` in `.env` to the **same** provider stack you want graded (see checklist below).
+
+**Hugging Face inference (router vs dedicated endpoint):**
+- **Router** (`https://router.huggingface.co/v1`): use a `MODEL_NAME` the router actually routes (see Hugging Face docs for current catalog). There is **no** automatic fallback to classic Hub `inputs` JSON from `inference.py`.
+- **Dedicated Inference Endpoint** (`https://…endpoints.huggingface.cloud/…`): `inference.py` appends `/v1` when missing so the OpenAI client hits `…/v1/chat/completions`. If chat is unsupported but the deployment still serves **text-generation** on the root URL, either rely on the built-in fallback (when the chat error looks like a route/surface issue) or set `MISSIONCTRL_HF_LLM_STRATEGY=native_only` to call native generation directly.
+- **Misconfiguration** (wrong model id, auth, or context limits) surfaces as a non-retrying `LlmConfigurationError` with a short hint instead of a long blind retry loop.
 
 ### Evaluation and training alignment checklist
 
 Hackathon and OpenEnv evaluators run **`inference.py` / `client.py` against your configured API**, not the Unsloth process. Fine-tuning improves the score only if the **same** `API_BASE_URL` and `MODEL_NAME` point at a stack that actually loads your trained adapter.
 
-1. **Confirm the scoring model** — After `train.py` pushes a LoRA adapter to HuggingFace, point inference at a **router or provider** that can serve the **base** you trained (default 3B canary: `unsloth/Llama-3.2-3B-Instruct`, or 8B: `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` when you switch) **plus** that adapter. If you leave inference defaults (`openai/gpt-oss-120b`, Groq `llama-3.3-70b-versatile`, etc.), you are not evaluating the weights you trained.
-2. **Match base model ID** — Training defaults to the Unsloth 3B instruct checkpoint; run **8B** only by setting `MISSIONCTRL_MODEL_NAME` to `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` after the 3B canary. Your served `MODEL_NAME` and LoRA must match the **same** base you fine-tuned.
+1. **Confirm the scoring model** — After `train.py` pushes a LoRA adapter to HuggingFace, point inference at a **router or provider** that can serve the **base** you trained (default: `Qwen/Qwen2.5-0.5B-Instruct`, or whatever you set in `MISSIONCTRL_MODEL_NAME`) **plus** that adapter. If you leave inference defaults (`openai/gpt-oss-120b`, Groq `llama-3.3-70b-versatile`, etc.), you are not evaluating the weights you trained.
+2. **Match base model ID** — Training defaults to `Qwen/Qwen2.5-0.5B-Instruct`. For a larger hub, set `MISSIONCTRL_MODEL_NAME` (e.g. `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit`) before training. Your served `MODEL_NAME` and LoRA must match the **same** base you fine-tuned.
 3. **Reproduce before submit** — From the same repo: run the server, set `API_BASE_URL` / `MODEL_NAME` / `HF_TOKEN` in `.env` to the intended eval stack, then run `python client.py` or `python inference.py` and compare scores to a smoke run on a public baseline model.
 4. **HF Hub is adapter by default** — `train.py` calls `push_to_hub` for the PEFT/LoRA adapter. Consumers must load **base + adapter** (for example with Unsloth/PEFT) unless you add a separate merge/publish step.
 
-**Workflow:** run a **full 3B** job with defaults first; when satisfied, re-run with `MISSIONCTRL_MODEL_NAME=unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit`. Optionally `python train.py --smoke-train` with the same 8B id to OOM-check before a long 8B run.
+**Workflow:** run a full job with defaults (`Qwen/Qwen2.5-0.5B-Instruct`) first; when you need more capacity, re-run with `MISSIONCTRL_MODEL_NAME` set to a larger hub id. Optionally `python train.py --smoke-train` with that id to OOM-check before a long run.
 
 **Training-only environment variables (optional, e.g. Kaggle Add-ons → Environment or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
 

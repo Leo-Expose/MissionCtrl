@@ -4,6 +4,9 @@ import os
 import sys
 import types
 
+import httpx
+import pytest
+
 os.environ.setdefault("API_BASE_URL", "http://example.com/v1")
 os.environ.setdefault("MODEL_NAME", "test-model")
 os.environ.setdefault("HF_TOKEN", "test-token")
@@ -28,10 +31,20 @@ if "tenacity" not in sys.modules:
 if "openai" not in sys.modules:
     openai_stub = types.ModuleType("openai")
 
+    class BadRequestError(Exception):
+        """Minimal stub matching openai.BadRequestError shape for inference tests."""
+
+        def __init__(self, message: str = "", *, response=None, body=None):
+            super().__init__(message)
+            self.response = response
+            self.body = body
+            self.status_code = getattr(response, "status_code", None) if response is not None else None
+
     class _OpenAIStub:
         def __init__(self, *args, **kwargs):
             pass
 
+    openai_stub.BadRequestError = BadRequestError
     openai_stub.OpenAI = _OpenAIStub
     sys.modules["openai"] = openai_stub
 
@@ -356,3 +369,254 @@ def test_contradiction_evidence_hint_is_keyword_rich_for_judge_signal():
     assert "contradicts" in lower
     assert "benchmark" in lower
     assert "reversed" in lower
+
+
+def test_normalize_openai_api_base_url_adds_v1_for_hf_dedicated_endpoint():
+    base = "https://demo.us-east4.gcp.endpoints.huggingface.cloud"
+    assert inference._normalize_openai_api_base_url(base) == f"{base}/v1"
+    assert inference._normalize_openai_api_base_url(f"{base}/") == f"{base}/v1"
+    assert inference._normalize_openai_api_base_url(f"{base}/v1") == f"{base}/v1"
+    assert inference._normalize_openai_api_base_url(f"{base}/v1/") == f"{base}/v1"
+
+
+def test_call_llm_falls_back_to_hf_native_endpoint_on_openai_404(monkeypatch):
+    called = {}
+
+    class _FailingCompletions:
+        def create(self, *args, **kwargs):
+            raise Exception("NotFoundError: Not Found")
+
+    class _OpenAIClientStub:
+        chat = types.SimpleNamespace(completions=_FailingCompletions())
+
+    class _ResponseStub:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"generated_text": "APPROVE(task_01)"}]
+
+    class _HttpStub:
+        def post(self, url, headers=None, json=None):
+            called["url"] = url
+            called["headers"] = headers
+            called["json"] = json
+            return _ResponseStub()
+
+    monkeypatch.setattr(
+        inference,
+        "API_BASE_URL",
+        "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/v1/",
+    )
+    monkeypatch.setattr(inference, "HF_TOKEN", "test-token")
+    monkeypatch.setattr(inference, "client", _OpenAIClientStub())
+    monkeypatch.setattr(inference, "http", _HttpStub())
+
+    result = inference._call_llm(
+        [
+            {"role": "system", "content": "You are a careful overseer."},
+            {"role": "user", "content": "Approve the safe task."},
+        ]
+    )
+
+    assert result == "APPROVE(task_01)"
+    assert called["url"] == "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/"
+    assert called["headers"]["Authorization"] == "Bearer test-token"
+    assert "<|im_start|>system" in called["json"]["inputs"]
+    assert "<|im_start|>user" in called["json"]["inputs"]
+    assert called["json"]["parameters"]["max_new_tokens"] == 120
+
+
+def test_call_llm_falls_back_to_hf_native_endpoint_on_openai_bad_request(monkeypatch):
+    called = {}
+
+    class _FailingCompletions:
+        def create(self, *args, **kwargs):
+            raise inference.BadRequestError("Error code: 400")
+
+    class _OpenAIClientStub:
+        chat = types.SimpleNamespace(completions=_FailingCompletions())
+
+    class _ResponseStub:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"generated_text": "NOOP"}]
+
+    class _HttpStub:
+        def post(self, url, headers=None, json=None):
+            called["url"] = url
+            return _ResponseStub()
+
+    monkeypatch.setattr(
+        inference,
+        "API_BASE_URL",
+        "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/v1/",
+    )
+    monkeypatch.setattr(inference, "HF_TOKEN", "test-token")
+    monkeypatch.setattr(inference, "client", _OpenAIClientStub())
+    monkeypatch.setattr(inference, "http", _HttpStub())
+
+    result = inference._call_llm(
+        [
+            {"role": "system", "content": "You are a careful overseer."},
+            {"role": "user", "content": "Pick an action."},
+        ]
+    )
+
+    assert result == "NOOP"
+    assert called["url"] == "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/"
+
+
+def test_hf_router_chat_failure_does_not_call_native_http(monkeypatch):
+    posts = []
+
+    class _FailingCompletions:
+        def create(self, *args, **kwargs):
+            raise inference.BadRequestError(
+                "bad",
+                response=types.SimpleNamespace(status_code=400),
+                body={"error": {"message": "maximum context length exceeded"}},
+            )
+
+    class _OpenAIClientStub:
+        chat = types.SimpleNamespace(completions=_FailingCompletions())
+
+    class _HttpStub:
+        def post(self, *args, **kwargs):
+            posts.append((args, kwargs))
+            raise AssertionError("native HF path must not be used for HF router")
+
+    monkeypatch.setattr(inference, "API_BASE_URL", "https://router.huggingface.co/v1")
+    monkeypatch.setattr(inference, "client", _OpenAIClientStub())
+    monkeypatch.setattr(inference, "http", _HttpStub())
+
+    with pytest.raises(inference.LlmConfigurationError):
+        inference._call_llm(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "go"},
+            ]
+        )
+    assert posts == []
+
+
+def test_hf_dedicated_model_error_skips_native_fallback(monkeypatch):
+    posts = []
+
+    class _FailingCompletions:
+        def create(self, *args, **kwargs):
+            raise inference.BadRequestError(
+                "model missing",
+                response=types.SimpleNamespace(status_code=400),
+                body={"error": {"message": "model not found", "param": "model"}},
+            )
+
+    class _OpenAIClientStub:
+        chat = types.SimpleNamespace(completions=_FailingCompletions())
+
+    class _HttpStub:
+        def post(self, *args, **kwargs):
+            posts.append(1)
+            return types.SimpleNamespace(raise_for_status=lambda: None, json=lambda: [{"generated_text": "NOOP"}])
+
+    monkeypatch.setattr(
+        inference,
+        "API_BASE_URL",
+        "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/v1/",
+    )
+    monkeypatch.setattr(inference, "client", _OpenAIClientStub())
+    monkeypatch.setattr(inference, "http", _HttpStub())
+
+    with pytest.raises(inference.LlmConfigurationError):
+        inference._call_llm(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "go"},
+            ]
+        )
+    assert posts == []
+
+
+def test_hf_dedicated_combined_failure_raises_llm_configuration_error(monkeypatch):
+    class _FailingCompletions:
+        def create(self, *args, **kwargs):
+            raise inference.BadRequestError(
+                "not found",
+                response=types.SimpleNamespace(status_code=404),
+                body=None,
+            )
+
+    class _OpenAIClientStub:
+        chat = types.SimpleNamespace(completions=_FailingCompletions())
+
+    class _HttpStub:
+        def post(self, url, headers=None, json=None):
+            req = httpx.Request("POST", url)
+            resp = httpx.Response(400, request=req, text="native unsupported")
+            raise httpx.HTTPStatusError("native failed", request=req, response=resp)
+
+    monkeypatch.setattr(
+        inference,
+        "API_BASE_URL",
+        "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/v1/",
+    )
+    monkeypatch.setattr(inference, "client", _OpenAIClientStub())
+    monkeypatch.setattr(inference, "http", _HttpStub())
+
+    with pytest.raises(inference.LlmConfigurationError) as err:
+        inference._call_llm(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "go"},
+            ]
+        )
+    assert "Native path" in str(err.value) or "native" in str(err.value).lower()
+
+
+def test_hf_dedicated_native_only_skips_openai_chat(monkeypatch):
+    called = {}
+
+    class _RaisingCompletions:
+        def create(self, *args, **kwargs):
+            raise AssertionError("OpenAI chat must not be used when native_only is set")
+
+    class _OpenAIClientStub:
+        chat = types.SimpleNamespace(completions=_RaisingCompletions())
+
+    class _ResponseStub:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"generated_text": "APPROVE(task_x)"}]
+
+    class _HttpStub:
+        def post(self, url, headers=None, json=None):
+            called["url"] = url
+            return _ResponseStub()
+
+    monkeypatch.setattr(
+        inference,
+        "API_BASE_URL",
+        "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/v1/",
+    )
+    monkeypatch.setattr(inference, "_HF_LLM_STRATEGY", "native_only")
+    monkeypatch.setattr(inference, "HF_TOKEN", "tok")
+    monkeypatch.setattr(inference, "client", _OpenAIClientStub())
+    monkeypatch.setattr(inference, "http", _HttpStub())
+
+    out = inference._call_llm(
+        [
+            {"role": "system", "content": "You are a careful overseer."},
+            {"role": "user", "content": "Pick an action."},
+        ]
+    )
+    assert out == "APPROVE(task_x)"
+    assert called["url"] == "https://demo.eu-west-1.aws.endpoints.huggingface.cloud/"
+
+
+def test_parse_hf_native_generation_payload_dict_outputs():
+    payload = {"outputs": [{"generated_text": "  FLAG(t1, \"x\")  "}]}
+    assert inference._parse_hf_native_generation_payload(payload) == 'FLAG(t1, "x")'

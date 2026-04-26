@@ -17,28 +17,27 @@ model-parallel loading.
 `accelerate launch` / multi-process DDP is not required for the default path; GRPO+Unsloth
 here is single-process. See README "Kaggle (2×T4 training)".
 
-Model  : default `unsloth/Llama-3.2-3B-Instruct` (full canary in one run). After 3B looks
-good, set `MISSIONCTRL_MODEL_NAME` to `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` (see
-`DEFAULT_MODEL_8B_UNSLOTH` in code). Gated hubs may need `HF_TOKEN` and license acceptance.
+Model  : default `Qwen/Qwen2.5-0.5B-Instruct` (fast Unsloth QLoRA canary). Override with
+`MISSIONCTRL_MODEL_NAME` for larger hubs (e.g. `DEFAULT_MODEL_8B_UNSLOTH` in code for 8B Llama).
+Gated hubs may need `HF_TOKEN` and license acceptance on Hugging Face.
 
 Method : GRPO (Group Relative Policy Optimization) via TRL
 
-Expected training time on 2×T4: full 350 max_steps 3B run often takes several hours.
-8B may exceed Kaggle session/runtime limits. Phase repeats add time.
-Expected reward curve: 0.28 to 0.75+ after 500 steps (stronger targets for the 8B run
-after 3B canary).
+Expected training time on 2×T4: 0.5B is much faster than 3B/8B; full curriculum still scales
+with steps and phase repeats. Larger models set via `MISSIONCTRL_MODEL_NAME` can take hours.
+Expected reward curve still depends on capacity; see reward_model.py.
 
 Default curriculum total: 500 GRPO max_steps (150+200+150) on a single GPU,
 plus per-phase eval; allow extra time if a phase repeats (see MAX_PHASE_REPEATS).
 T4 (low VRAM): same step counts unless you set MISSIONCTRL_SMOKE_STEPS or
 MISSIONCTRL_T4_CURRICULUM — expect wall time much longer than A100 (often hours more).
 
-Pre-flight (3B default, 8B only after verification):
+Pre-flight (default Qwen 0.5B Instruct; larger models via env):
   1) `pytest tests/test_train_grpo.py` and `python train.py --reward-smoke` (no GPU model)
-  2) Optional: `python train.py --smoke-train` on default 3B (2 GRPO steps)
-  3) Full `train` with defaults = 3B canary (full curriculum)
-  4) `MISSIONCTRL_MODEL_NAME=unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` and full train for 8B
-  Optional: same 8B id + `python train.py --smoke-train` to OOM-check 8B before a long run
+  2) Optional: `python train.py --smoke-train` (2 GRPO steps by default)
+  3) Full `train` with defaults = Qwen 0.5B canary (full curriculum)
+  4) Optional larger base: `MISSIONCTRL_MODEL_NAME=unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit`
+     (or other HF id) + `python train.py --smoke-train` to OOM-check before a long run
   Also: `python train.py --baseline-only` (no GRPO).
 
 Reward ceiling: 0.85 (not 1.0). A score of 0.75+ represents ~88% of maximum.
@@ -121,12 +120,12 @@ if HF_TOKEN:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Unsloth 3.1 8B Instruct 4-bit — use after 3B canary succeeds (set MISSIONCTRL_MODEL_NAME).
+# Optional larger Unsloth base — set MISSIONCTRL_MODEL_NAME to this or another hub id.
 DEFAULT_MODEL_8B_UNSLOTH = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 
 MODEL_NAME      = os.environ.get(
     "MISSIONCTRL_MODEL_NAME",
-    "unsloth/Llama-3.2-3B-Instruct",
+    "Qwen/Qwen2.5-0.5B-Instruct",
 )
 MAX_SEQ_LEN     = 4096
 # Aligned with GRPOConfig.max_completion_length, evaluate() max_new_tokens, and FIX #22 prompt cap.
