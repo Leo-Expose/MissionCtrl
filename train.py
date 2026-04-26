@@ -24,11 +24,12 @@ Gated hubs may need `HF_TOKEN` and license acceptance on Hugging Face.
 Method : GRPO (Group Relative Policy Optimization) via TRL
 
 Expected training time on 2×T4: 0.5B is much faster than 3B/8B; full curriculum still scales
-with steps and phase repeats. Larger models set via `MISSIONCTRL_MODEL_NAME` can take hours.
+with steps. Larger models set via `MISSIONCTRL_MODEL_NAME` can take hours.
 Expected reward curve still depends on capacity; see reward_model.py.
 
 Default curriculum total: ~600 GRPO max_steps (200+220+180) on a single GPU,
-plus per-phase eval; allow extra time if a phase repeats (see MAX_PHASE_REPEATS).
+plus per-phase eval (advisory when MISSIONCTRL_CURRICULUM_GATE is off). Set
+MISSIONCTRL_CURRICULUM_GATE=1 to repeat phases until min_reward (see MAX_PHASE_REPEATS).
 T4 (low VRAM): same step counts unless you set MISSIONCTRL_SMOKE_STEPS or
 MISSIONCTRL_T4_CURRICULUM — expect wall time much longer than A100 (often hours more).
 
@@ -77,6 +78,18 @@ warnings.filterwarnings(
     message=r".*Transformers v5\.10.*",
     category=FutureWarning,
 )
+# TRL / Transformers 5.x internal kwargs migration (not actionable here).
+for _cat in (DeprecationWarning, FutureWarning, UserWarning):
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*use_return_dict.*",
+        category=_cat,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Passing `generation_config` together with generation-related arguments.*",
+        category=_cat,
+    )
 # Pre-bind torch submodules that some torch/unsloth_zoo builds (e.g. Kaggle's
 # torch 2.10.0+cu128) do not auto-load. Without these imports, importing
 # `unsloth` triggers `unsloth_zoo.temporary_patches.common` -> `torch._inductor`
@@ -186,7 +199,7 @@ except Exception:
     NUM_GENERATIONS = 4
     GRAD_ACCUM = 4
 
-# Curriculum: start easy, escalate — gate on reward threshold before advancing
+# Curriculum: start easy, escalate (optional MISSIONCTRL_CURRICULUM_GATE repeats on low eval).
 # FIX #13: easy phase now uses 3 tasks (consistent with documentation)
 try:
     if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -229,6 +242,14 @@ if os.environ.get("MISSIONCTRL_T4_CURRICULUM", "").strip().lower() in ("1", "tru
 
 # Kaggle: default none; local debugging: MISSIONCTRL_REPORT_TO=tensorboard
 _DEFAULT_REPORT = os.environ.get("MISSIONCTRL_REPORT_TO", "none").strip() or "none"
+
+
+def _curriculum_gate_enabled() -> bool:
+    """
+    When True, repeat a curriculum phase until eval reaches min_reward or max attempts.
+    Default False: run each phase once and always advance (eval is advisory for debugging).
+    """
+    return os.environ.get("MISSIONCTRL_CURRICULUM_GATE", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _phase_n_samples(phase_steps: int) -> int:
@@ -447,6 +468,10 @@ def _grpo_config_generation_extras_if_supported(tokenizer) -> dict:
     """
     If this TRL version supports it, pass a minimal GenerationConfig (no max_length) so
     `generate` does not merge hub defaults with max_new_tokens. Omitted on older TRL.
+
+    Not merged into GRPOConfig by default: Transformers 5.5+ warns when both
+    ``generation_config`` and call-time kwargs overlap. Opt in with
+    MISSIONCTRL_USE_GRPO_GENERATION_CONFIG=1, or legacy MISSIONCTRL_SKIP_GRPO_GENERATION_CONFIG=0.
     """
     try:
         if "generation_config" not in inspect.signature(GRPOConfig.__init__).parameters:
@@ -683,6 +708,11 @@ def run_baseline() -> float:
     mean = float(np.mean(rewards))
     print(f"\n  Baseline mean reward: {mean:.3f}")
     print(f"  (Expected post-training: 0.68+; ceiling is 0.85)")
+    if not _curriculum_gate_enabled():
+        print(
+            "  ℹ️  This baseline is for reference only; curriculum does not block on phase eval "
+            "when MISSIONCTRL_CURRICULUM_GATE is unset or 0."
+        )
     return mean
 
 
@@ -751,7 +781,7 @@ class FlatRewardEarlyStopCallback(TrainerCallback):
             )
 
 
-# ── Training Loop with Curriculum Gating ─────────────────────────────────────
+# ── Training Loop (optional curriculum reward gate) ──────────────────────────
 
 def train():
     is_smoke = bool(os.environ.get("MISSIONCTRL_SMOKE_STEPS", "").strip())
@@ -766,18 +796,31 @@ def train():
 
     all_rewards_history = []
     curriculum = _effective_curriculum()
+    curriculum_gate = _curriculum_gate_enabled()
+    if curriculum_gate:
+        print(
+            "  ℹ️  MISSIONCTRL_CURRICULUM_GATE=1: phases may repeat until eval ≥ min_reward "
+            f"or {MAX_PHASE_REPEATS + 1} attempts."
+        )
+    else:
+        print(
+            "  ℹ️  Curriculum reward gate off (default): each phase runs once; "
+            "post-phase eval is advisory only."
+        )
 
     for phase_idx, phase in enumerate(curriculum):
+        base_steps = int(phase["steps"])
+        max_attempts = (MAX_PHASE_REPEATS + 1) if curriculum_gate else 1
         phase_attempts = 0
-        phase_passed   = False
 
-        while phase_attempts <= MAX_PHASE_REPEATS and not phase_passed:
+        while True:
             phase_attempts += 1
-            attempt_label = f"(attempt {phase_attempts}/{MAX_PHASE_REPEATS + 1})"
-
-            # Give retries extra GRPO budget — first failure is often under-training, not a bad seed only.
-            base_steps = int(phase["steps"])
-            effective_steps = base_steps if phase_attempts == 1 else int(base_steps * 1.4) + 24
+            if curriculum_gate:
+                effective_steps = base_steps if phase_attempts == 1 else int(base_steps * 1.4) + 24
+                attempt_label = f"(attempt {phase_attempts}/{max_attempts})"
+            else:
+                effective_steps = base_steps
+                attempt_label = "(single pass)"
 
             print(f"\n{'=' * 60}")
             print(
@@ -822,9 +865,13 @@ def train():
                 report_to                   = _DEFAULT_REPORT,
                 seed                        = 42,
             )
-            if os.environ.get("MISSIONCTRL_SKIP_GRPO_GENERATION_CONFIG", "").strip().lower() not in (
-                "1", "true", "yes",
-            ):
+            _use_grpo_gc = os.environ.get(
+                "MISSIONCTRL_USE_GRPO_GENERATION_CONFIG", ""
+            ).strip().lower() in ("1", "true", "yes")
+            _legacy_merge_gc = os.environ.get(
+                "MISSIONCTRL_SKIP_GRPO_GENERATION_CONFIG", ""
+            ).strip().lower() in ("0", "false", "no")
+            if _use_grpo_gc or _legacy_merge_gc:
                 _grpo_kwargs.update(_grpo_config_generation_extras_if_supported(tokenizer))
             try:
                 grpo_config = GRPOConfig(**_grpo_kwargs)
@@ -843,42 +890,50 @@ def train():
 
             trainer.train()
 
-            # Evaluate after training — gate advancement on hitting min_reward
             avg_reward, metrics = evaluate(
                 model, tokenizer,
                 phase["difficulty"], phase["num_tasks"],
                 is_mid_training=True,
             )
 
+            history_entry = {
+                "phase":      phase_idx + 1,
+                "difficulty": phase["difficulty"],
+                "avg_reward": avg_reward,
+                "metrics":    metrics,
+                "attempts":   phase_attempts,
+            }
+
+            if not curriculum_gate:
+                all_rewards_history.append(history_entry)
+                print(
+                    f"\n  Phase {phase_idx + 1} post-train eval (advisory): reward={avg_reward:.3f} | "
+                    f"curriculum reference threshold={phase['min_reward']:.2f} (not used to block or repeat)."
+                )
+                print(
+                    "  ℹ️  Logged GRPO reward optimizes the first completion step (+ scripted rollout in "
+                    "grpo_rewards); eval is full greedy episodes — they can diverge until the policy generalizes."
+                )
+                break
+
             if avg_reward >= phase["min_reward"]:
-                phase_passed = True
-                all_rewards_history.append({
-                    "phase":      phase_idx + 1,
-                    "difficulty": phase["difficulty"],
-                    "avg_reward": avg_reward,
-                    "metrics":    metrics,
-                    "attempts":   phase_attempts,
-                })
+                all_rewards_history.append(history_entry)
                 print(
                     f"\n  ✅ Phase {phase_idx + 1} PASSED | "
                     f"reward={avg_reward:.3f} ≥ threshold={phase['min_reward']:.2f}"
                 )
-            else:
+                break
+            if phase_attempts >= max_attempts:
+                all_rewards_history.append(history_entry)
                 print(
                     f"\n  ⚠️  Phase {phase_idx + 1} threshold not met: "
-                    f"{avg_reward:.3f} < {phase['min_reward']:.2f}"
+                    f"{avg_reward:.3f} < {phase['min_reward']:.2f} — max attempts reached, advancing."
                 )
-                if phase_attempts <= MAX_PHASE_REPEATS:
-                    print(f"     Repeating phase...")
-                else:
-                    print(f"     Max attempts reached — advancing anyway.")
-                    all_rewards_history.append({
-                        "phase":      phase_idx + 1,
-                        "difficulty": phase["difficulty"],
-                        "avg_reward": avg_reward,
-                        "metrics":    metrics,
-                        "attempts":   phase_attempts,
-                    })
+                break
+            print(
+                f"\n  ⚠️  Phase {phase_idx + 1} threshold not met: "
+                f"{avg_reward:.3f} < {phase['min_reward']:.2f}\n     Repeating phase..."
+            )
 
     # Save reward curve
     print("\n📈 Generating reward curve...")
@@ -953,5 +1008,10 @@ if __name__ == "__main__":
         else:
             baseline = run_baseline()
             print(f"\n🎯 Baseline established: {baseline:.3f} (ceiling: 0.85)")
+        _gate_on = _curriculum_gate_enabled()
+        print(
+            "  ℹ️  MISSIONCTRL_CURRICULUM_GATE="
+            f"{'1 — phases may repeat until eval ≥ min_reward' if _gate_on else '0 — each phase runs once; eval is advisory'}"
+        )
         print("Starting curriculum training...\n")
         train()
