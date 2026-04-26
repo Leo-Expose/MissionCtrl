@@ -1,4 +1,6 @@
 .venv/
+# Local venv for Kaggle CLI (optional, see README)
+.venv-cli/
 __pycache__/
 *.pyc
 *.egg-info/
@@ -12,3 +14,6 @@ reward_curve.png
 .codex
 AGENTS.md
 graphify-out
+.cursor/debug-*.log
+# Local Kaggle kernel push bundle (copy example + notebook; do not commit personal kernel-metadata)
+kaggle/missionctrl-kernel/

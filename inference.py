@@ -12,6 +12,11 @@ Quick-start:
   export MODEL_NAME=openai/gpt-oss-120b
   export HF_TOKEN=hf_xxxxx
   python inference.py
+
+Hugging Face dedicated Inference Endpoints (`*.endpoints.huggingface.cloud`):
+  - `API_BASE_URL` is normalized to end with `/v1` for OpenAI-compatible chat.
+  - If chat fails but classic text-generation works, set `MISSIONCTRL_HF_LLM_STRATEGY=native_only`
+    to skip chat and POST `inputs` to the endpoint root.
 """
 
 from __future__ import annotations
@@ -26,11 +31,12 @@ import textwrap
 import time
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, before_sleep_log, retry_if_not_exception_type
 import logging as _logging
 
@@ -39,10 +45,27 @@ import logging as _logging
 # ---------------------------------------------------------------------------
 load_dotenv()
 
+
+def _is_hf_dedicated_endpoint(base_url: str) -> bool:
+    return "endpoints.huggingface.cloud" in (base_url or "")
+
+
+def _normalize_openai_api_base_url(url: str) -> str:
+    """HF dedicated Inference Endpoints expect OpenAI clients to use a .../v1 base URL."""
+    base = (url or "").strip().rstrip("/")
+    if not base:
+        return url or ""
+    if _is_hf_dedicated_endpoint(base) and not base.endswith("/v1"):
+        return f"{base}/v1"
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Mandatory environment variables
 # ---------------------------------------------------------------------------
-API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+API_BASE_URL: str = _normalize_openai_api_base_url(
+    os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+)
 MODEL_NAME: str   = os.environ.get("MODEL_NAME", "openai/gpt-oss-120b")
 HF_TOKEN: str     = os.environ.get("HF_TOKEN", "")
 
@@ -98,6 +121,243 @@ _retry_logger = _logging.getLogger("missionctrl.retry")
 
 class PromptTooLargeError(RuntimeError):
     """Raised when provider rejects a request as permanently oversized."""
+
+
+class LlmConfigurationError(RuntimeError):
+    """Unrecoverable LLM endpoint/model/auth issue — do not retry the same request."""
+
+
+class _LlmProviderKind(str, Enum):
+    """How we talk to the configured API_BASE_URL for chat-style generation."""
+
+    HF_ROUTER = "hf_router"
+    HF_DEDICATED = "hf_dedicated"
+    OPENAI_COMPATIBLE = "openai_compatible"
+
+
+def _llm_provider_kind(base_url: str) -> _LlmProviderKind:
+    low = (base_url or "").lower()
+    if "router.huggingface.co" in low:
+        return _LlmProviderKind.HF_ROUTER
+    if _is_hf_dedicated_endpoint(base_url):
+        return _LlmProviderKind.HF_DEDICATED
+    return _LlmProviderKind.OPENAI_COMPATIBLE
+
+
+# HF dedicated endpoints: `chat_first` (default) uses OpenAI /v1/chat/completions then
+# optional native `inputs` fallback. `native_only` skips chat and POSTs to the root URL.
+_HF_LLM_STRATEGY: str = os.environ.get("MISSIONCTRL_HF_LLM_STRATEGY", "chat_first").strip().lower()
+
+
+def _hf_native_base_url(base_url: str) -> str:
+    base = (base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return base.rstrip("/") + "/"
+
+
+def _short_exc(exc: BaseException, limit: int = 400) -> str:
+    text = str(exc).strip() or repr(exc)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _openai_error_blob(exc: Exception) -> str:
+    """Concatenate exception message and JSON/text body for heuristics."""
+    chunks: List[str] = [str(exc)]
+    body = getattr(exc, "body", None)
+    if body is not None:
+        if isinstance(body, (dict, list)):
+            try:
+                chunks.append(json.dumps(body))
+            except (TypeError, ValueError):
+                chunks.append(repr(body))
+        else:
+            chunks.append(str(body))
+    return "\n".join(chunks)
+
+
+def _openai_http_status(exc: Exception) -> Optional[int]:
+    code = getattr(exc, "status_code", None)
+    if code is not None:
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            pass
+    cause = exc.__cause__
+    if isinstance(cause, httpx.HTTPStatusError) and cause.response is not None:
+        return int(cause.response.status_code)
+    ctx = exc.__context__
+    if isinstance(ctx, httpx.HTTPStatusError) and ctx.response is not None:
+        return int(ctx.response.status_code)
+    return None
+
+
+_MODEL_OR_AUTH_DENY_SUBSTR: Tuple[str, ...] = (
+    "invalid model",
+    "model_not_found",
+    "model not found",
+    "unknown model",
+    "does not exist",
+    "must be one of",
+    "incorrect api key",
+    "invalid api key",
+    "authentication",
+    "unauthorized",
+    "permission denied",
+    "access denied",
+    "model is required",
+)
+
+_SIZE_DENY_SUBSTR: Tuple[str, ...] = (
+    "request too large",
+    "context length",
+    "maximum context",
+    "token limit",
+    "too many tokens",
+    "longer than the model",
+    "reduce the length",
+)
+
+
+def _llm_error_indicates_model_auth_or_size(blob: str) -> bool:
+    b = blob.lower().replace(" ", "")
+    if any(s in b for s in (x.replace(" ", "") for x in _SIZE_DENY_SUBSTR)):
+        return True
+    if '"param":"model"' in b or "'param':'model'" in b or '"param": "model"' in blob.lower():
+        return True
+    b2 = blob.lower()
+    if "model" in b2 and "not found" in b2:
+        return True
+    if any(s in b2 for s in _MODEL_OR_AUTH_DENY_SUBSTR):
+        return True
+    return False
+
+
+def _llm_error_indicates_chat_route_missing(blob: str, status: Optional[int]) -> bool:
+    if status == 404:
+        return True
+    if status == 405:
+        return True
+    b = blob.lower()
+    return any(
+        h in b
+        for h in (
+            "chat completions",
+            "chat_completions",
+            "unknown path",
+            "invalid path",
+            "no such route",
+            "not supported",
+        )
+    )
+
+
+def _should_try_hf_native_fallback(exc: Exception) -> bool:
+    """True only for HF dedicated hosts when chat failed for a likely transport/surface issue."""
+    if _llm_provider_kind(API_BASE_URL) != _LlmProviderKind.HF_DEDICATED:
+        return False
+    blob = _openai_error_blob(exc)
+    lower = blob.lower()
+    if _llm_error_indicates_model_auth_or_size(lower):
+        return False
+    status = _openai_http_status(exc)
+
+    if status == 404 or _llm_error_indicates_chat_route_missing(blob, status):
+        return True
+    if status == 400 and not _llm_error_indicates_model_auth_or_size(lower):
+        return True
+    # Wrapped / stub exceptions without status_code
+    if status is None and "404" in lower and "not found" in lower:
+        return True
+    if status is None and "400" in lower and not _llm_error_indicates_model_auth_or_size(lower):
+        return True
+    if status is None:
+        compact = lower.replace(" ", "").replace("_", "")
+        if ("notfound" in compact or "404" in lower) and "modelnotfound" not in compact:
+            if not _llm_error_indicates_model_auth_or_size(lower):
+                return True
+    return False
+
+
+def _messages_to_chatml_prompt(messages: List[Dict[str, str]]) -> str:
+    parts: List[str] = []
+    for message in messages:
+        role = (message.get("role") or "user").strip().lower()
+        if role not in {"system", "user", "assistant"}:
+            role = "user"
+        content = (message.get("content") or "").strip()
+        if not content:
+            continue
+        parts.append(f"<|im_start|>{role}\n{content}\n<|im_end|>")
+    parts.append("<|im_start|>assistant\n")
+    return "\n".join(parts)
+
+
+def _parse_hf_native_generation_payload(payload: Any) -> str:
+    if isinstance(payload, list) and payload:
+        head = payload[0]
+        if isinstance(head, dict):
+            return str(head.get("generated_text") or "").strip()
+        if isinstance(head, str):
+            return head.strip()
+    if isinstance(payload, dict):
+        if "generated_text" in payload:
+            return str(payload.get("generated_text") or "").strip()
+        outs = payload.get("outputs")
+        if isinstance(outs, list) and outs and isinstance(outs[0], dict):
+            return str(outs[0].get("generated_text") or "").strip()
+    raise RuntimeError(f"Unexpected Hugging Face generation response format: {type(payload).__name__}")
+
+
+def _call_hf_native_text_generation(messages: List[Dict[str, str]]) -> str:
+    prompt = _messages_to_chatml_prompt(messages)
+    url = _hf_native_base_url(API_BASE_URL)
+    try:
+        response = http.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 120,
+                    "temperature": 0.0,
+                    "return_full_text": False,
+                },
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as err:
+        snippet = ""
+        try:
+            snippet = (err.response.text or "")[:600]
+        except Exception:
+            pass
+        raise LlmConfigurationError(
+            "HF native text-generation request failed "
+            f"(HTTP {err.response.status_code} on {url}). "
+            f"Body snippet: {snippet or '(empty)'}"
+        ) from err
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as err:
+        raise LlmConfigurationError(f"HF native response was not JSON from {url}") from err
+    try:
+        return _parse_hf_native_generation_payload(payload)
+    except RuntimeError as err:
+        raise LlmConfigurationError(f"{err} (url={url})") from err
+
+
+def _call_openai_chat(messages: List[Dict[str, str]]) -> str:
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.0,
+        max_tokens=120,
+    )
+    return (completion.choices[0].message.content or "").strip()
 
 
 def _append_bounded_unique(bucket: List[str], value: str, limit: int) -> None:
@@ -1054,28 +1314,49 @@ def _spinner(msg: str = "🤖 Asking LLM"):
     stop=stop_after_attempt(LLM_MAX_RETRIES),
     wait=wait_exponential(multiplier=2, min=2, max=30),
     before_sleep=before_sleep_log(_retry_logger, _logging.WARNING),
-    retry=retry_if_not_exception_type(PromptTooLargeError),
+    retry=retry_if_not_exception_type((PromptTooLargeError, LlmConfigurationError)),
     reraise=True,
 )
 def _call_llm(messages: List[Dict[str, str]]) -> str:
     """Call the LLM and return raw action string."""
+    provider = _llm_provider_kind(API_BASE_URL)
+    if provider == _LlmProviderKind.HF_DEDICATED and _HF_LLM_STRATEGY in {"native_only", "native"}:
+        return _call_hf_native_text_generation(messages)
+
     try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=120,
-        )
+        return _call_openai_chat(messages)
     except Exception as exc:
         msg = str(exc)
         lower_msg = msg.lower()
+        blob = _openai_error_blob(exc)
+        lower_blob = blob.lower()
+
+        if _llm_error_indicates_model_auth_or_size(lower_blob):
+            raise LlmConfigurationError(
+                "LLM request rejected (model, auth, or context/token limits). "
+                f"MODEL_NAME={MODEL_NAME!r} API_BASE_URL={API_BASE_URL!r} — {_short_exc(exc)}"
+            ) from exc
+
+        if _should_try_hf_native_fallback(exc):
+            try:
+                return _call_hf_native_text_generation(messages)
+            except LlmConfigurationError:
+                raise
+            except Exception as native_exc:
+                raise LlmConfigurationError(
+                    "HF dedicated endpoint: OpenAI-compatible chat failed and native "
+                    f"generation also failed.\n  Chat path: {_short_exc(exc)}\n"
+                    f"  Native path: {_short_exc(native_exc)}\n"
+                    "  Hint: confirm API_BASE_URL ends with /v1 for chat; set "
+                    "MISSIONCTRL_HF_LLM_STRATEGY=native_only if this deployment has no "
+                    "/v1/chat/completions route; verify MODEL_NAME matches the deployment."
+                ) from native_exc
+
         if "request too large" in lower_msg or ("tokens per minute" in lower_msg and "requested" in lower_msg):
             raise PromptTooLargeError(f"Prompt too large: {msg.splitlines()[0]}") from exc
         if "429" in msg or "rate_limit" in msg.lower():
             raise RuntimeError(f"Rate-limited: {msg.splitlines()[0]}") from exc
         raise
-
-    return (completion.choices[0].message.content or "").strip()
 
 
 def _build_obs_message(

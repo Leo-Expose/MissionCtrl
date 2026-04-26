@@ -13,7 +13,7 @@ env:
     description: The model identifier to use for inference
     required: true
   - name: HF_TOKEN
-    description: Your Hugging Face / API key
+    description: API key passed to the OpenAI client (hf_... for Hugging Face, gsk_... for Groq, etc.)
     required: true
 
 tasks:

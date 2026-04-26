@@ -28,23 +28,24 @@ from enum import Enum
 # OpenEnv integration
 # ─────────────────────────────────────────────
 
+# Fallback base when openenv is missing or the metapackage has no legacy `Env`
+# (pip `openenv` often exposes `openenv.core.Environment` only; see tests/test_env_parity.py)
+class _BaseEnv:
+    metadata = {}
+    def reset(self, **kwargs): raise NotImplementedError
+    def step(self, action): raise NotImplementedError
+    def render(self): pass
+    def close(self): pass
+
 try:
     import openenv
     OPENENV_AVAILABLE = True
 except ImportError:
+    openenv = None  # type: ignore[assignment]
     OPENENV_AVAILABLE = False
-    # Fallback base class if openenv not installed
-    class _BaseEnv:
-        metadata = {}
-        def reset(self, **kwargs): raise NotImplementedError
-        def step(self, action): raise NotImplementedError
-        def render(self): pass
-        def close(self): pass
 
-if OPENENV_AVAILABLE:
-    BaseEnv = openenv.Env
-else:
-    BaseEnv = _BaseEnv
+_legacy_env = getattr(openenv, "Env", None) if openenv is not None else None
+BaseEnv = _legacy_env if _legacy_env is not None else _BaseEnv
 
 # ─────────────────────────────────────────────
 # Data Structures

@@ -346,9 +346,10 @@ pytest tests/ -v
 
 | Variable | Default | Description |
 |---|---|---|
-| `API_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible LLM API endpoint |
-| `MODEL_NAME` | `openai/gpt-oss-120b` | Model to use |
-| `HF_TOKEN` | — | API key |
+| `API_BASE_URL` | `https://router.huggingface.co/v1` | OpenAI-compatible LLM API endpoint (must include `/v1` for hosts that expose `…/v1/chat/completions`) |
+| `MODEL_NAME` | `openai/gpt-oss-120b` | Model id **as expected by that host** (router catalog, provider deployment, etc.). Training’s `MISSIONCTRL_MODEL_NAME` does **not** override this automatically. |
+| `HF_TOKEN` | — | API key passed to the OpenAI client (`hf_…` on Hugging Face, `gsk_…` on Groq, etc.) |
+| `MISSIONCTRL_HF_LLM_STRATEGY` | `chat_first` | For **HF dedicated** endpoints only: `chat_first` (OpenAI chat, then optional native `inputs` fallback) or `native_only` (skip chat; use classic generation on the endpoint root). |
 | `ENV_BASE_URL` | `http://localhost:7860` | MissionCtrl server base URL (same default port as Docker / `server.app`) |
 | `STEP_DELAY_S` | `4.0` | Delay between steps (reduce for speed) |
 | `VERBOSE_TRACE` | `1` | Show detailed step traces |
@@ -360,38 +361,137 @@ pytest tests/ -v
 
 #### GRPO / LoRA training (optional)
 
-Set these in the shell or Colab **before** running `train.py` (not read from `.env` by default):
+Set these in Kaggle **Add-ons → Environment** or in a shell **before** running `train.py` (not read from `.env` by default):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MISSIONCTRL_MODEL_NAME` | `Qwen/Qwen2.5-0.5B-Instruct` | Unsloth QLoRA base. Default is **Qwen2.5 0.5B Instruct** (fast canary). For a larger model, set e.g. `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit` or `unsloth/Llama-3.2-3B-Instruct`. Gated hubs may need `HF_TOKEN` and license acceptance. |
 | `MISSIONCTRL_LORA_RANK` | `16` | LoRA rank. Council guidance: start at 16; try `32` if a baseline run plateaus. |
 | `MISSIONCTRL_EARLY_STOP_PHASE1` | `1` | If set to `1`, enables early stop when phase 1 (easy) reward is flat after a minimum step count. |
 | `MISSIONCTRL_EARLY_STOP_MIN_STEPS` | `75` | Minimum training steps in phase 1 before the flat-reward check applies. |
 | `MISSIONCTRL_EARLY_STOP_LOG_WINDOW` | `3` | Number of recent `logging_steps` log points used to detect a flat reward. |
+| `MISSIONCTRL_SMOKE_STEPS` | (unset) | If set to a positive integer, `train()` runs a single easy phase with that many `max_steps` and skips `push_to_hub` (GPU dry run). |
+| `MISSIONCTRL_T4_CURRICULUM` | (unset) | If `1`/`true`/`yes` on a **single** GPU, uses a shorter 100+150+100 step curriculum. |
+| `MISSIONCTRL_DEVICE_MAP` | (unset) | Keep unset for stable GRPO generation on Kaggle; the model loads on one CUDA device while the 2×T4 curriculum is still shortened. Set to `balanced` only to experiment with model-parallel loading; it can trigger `cuda:0`/`cuda:1` tensor mismatch errors during Unsloth generation. |
+
+### Kaggle training and Kaggle CLI
+
+Training on Kaggle can be done **only in the browser** or with the **official [Kaggle CLI](https://github.com/Kaggle/kaggle-api)** to create a **kernel** and `push` a notebook. The same [`notebook.ipynb`](notebook.ipynb) is used: it has a **Kaggle (2×T4)** section. [`train.py`](train.py) needs the local modules `grpo_rewards.py`, `environment.py`, and `reward_model.py` (and any of their local imports) on the Python path—either by **cloning** a public git repo, by **attaching a Kaggle dataset** that contains the repo, or by **copying** those files next to the notebook in a CLI push folder.
+
+**API caveat — 2× T4:** [`kernel-metadata.json`](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md) can set `enable_gpu` and `enable_internet`, but **accelerator type and “2× T4” are not fully controlled** by a minimal JSON file. After the first `kernels push`, open the kernel in the Kaggle **editor** and set **2 × T4** under **Settings** (or configure once, then `kaggle kernels pull -k username/kernel-slug -m -p <dir>` to keep metadata that matches the UI; see the [Kaggle kernels docs](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels.md)).
+
+#### Prerequisites
+
+- A Kaggle account. For **gated** Unsloth bases, accept the license on HuggingFace and use a Kaggle **Secret** named `HF_TOKEN` (value is your `hf_...` token) with **Add-ons → Secrets → Attach to the environment** so `train.py` can log in.
+- The [`notebook.ipynb`](notebook.ipynb) clone cell defaults to `https://github.com/Fnc-Jit/MissionCtrl.git`; set **Add-ons → Environment** variable `MISSIONCTRL_REPO_URL` to your public fork if you do not use that default.
+- Local machine (for **Option B** only): a working [Kaggle CLI](https://github.com/Kaggle/kaggle-api) and auth (see [Local Kaggle CLI: install and token](#local-kaggle-cli-install-and-token) at the end of this section). Official metadata fields are [documented here](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md#contents).
+- In [`train.py`](train.py), set a real `HF_REPO` and **do not commit** your HuggingFace or Kaggle API tokens in the repository.
+
+#### Troubleshooting
+
+- **`Directory 'MissionCtrl' exists but is incomplete`:** The clone + verify cell found a `MissionCtrl` folder that is missing one or more of the required modules (`train.py`, `grpo_rewards.py`, `grpo_completion.py`, etc.). Delete that folder in the Kaggle file browser (or run `!rm -rf MissionCtrl` after `%cd /kaggle/working`), then re-run the cell; or set `MISSIONCTRL_REPO_URL` to a full repository; or use **Add data** with a dataset that contains a complete checkout.
+- **`No module named 'environment'`** (or other local modules) after clone: Jupyter does not put the post-clone working directory on `sys.path` by default. Re-run the **clone + verify** cell (it prepends the repo root to `sys.path`); if you use an older notebook, run the latest version from the repo or add the same `sys.path` step from that cell.
+- **`AttributeError: module 'torch' has no attribute '_utils'`** when importing `train` on Kaggle: caused by an Unsloth-Zoo / `torch._dynamo` initialization race on newer torch builds (e.g. torch `2.10.x`). [`train.py`](train.py) pre-imports `torch._utils` before `from unsloth import FastLanguageModel` to avoid it; if you pin an older `train.py`, add `import torch; import torch._utils` before any Unsloth import, or re-run from the current notebook so the top-of-file workaround loads.
+
+#### Option A: Kaggle.com only (import the notebook, run training)
+
+1. Open **Kaggle** → **Code** → **New notebook**.
+2. In **Settings** (or the notebook’s sidebar), turn **Internet** **ON** (needed for `pip` and model downloads from HuggingFace). Set **2 × T4** under the accelerator for GRPO. Session length limits still apply; see [`train.py`](train.py) for the shorter 2-GPU curriculum.
+3. **Add-ons → Secrets**: add `HF_TOKEN` and check **Attach to the environment**.
+4. Get the project files into the session. If you only upload [`notebook.ipynb`](notebook.ipynb), run the **install** cell, then the **clone + verify** cell: it first looks for the required modules in the current directory, then under **`/kaggle/input/<dataset-name>/`** for any **Add data** dataset (read-only; the notebook `cd`s there), then `git clone`s the default public repo to `MissionCtrl/` under [`/kaggle/working`](https://www.kaggle.com/docs) when still missing. Alternatives:
+   - **Add data** — attach a dataset that contains `train.py` and the env modules; the verify cell will find them under `/kaggle/input/…`. **or**
+   - **Manually** `%cd /kaggle/working` and `!git clone <url>`, then `%cd` the repo. Private repos: use a **Kaggle dataset** with a checkout, or set `MISSIONCTRL_REPO_URL` in **Add-ons → Environment**.
+5. Open the first cells: run the **Install dependencies** cell, then the **clone + verify** cell, then **Verify GPU**. The clone + verify cell checks for `train.py`, `grpo_rewards.py`, `grpo_completion.py`, `environment.py`, and `reward_model.py`.
+6. Run a smoke job first, then a full run:
+   - `!python train.py --smoke-train` (short, no default Hub push when smoke is active), or
+   - `!python train.py` for the full curriculum, or use the **Run all** flow from the training cells in the notebook.
+7. **Checkpoints and plots:** on Kaggle, `train.py` uses `/kaggle/working/missionctrl_checkpoints` when the platform sets `KAGGLE_KERNEL_RUN_TYPE` or when `/kaggle/working` exists. Use **Save Version** / **Output** to keep artifacts, or rely on `push_to_hub` when you are not in a smoke run.
+
+#### Option B: Create a kernel and push with the Kaggle CLI
+
+1. On your **local** machine, install the CLI in a venv and authenticate (see [Local Kaggle CLI: install and token](#local-kaggle-cli-install-and-token) below). Verify with `kaggle competitions list -s titanic` or your usual online command.
+2. Create a **push directory** (not committed: `kaggle/missionctrl-kernel/` is in [.gitignore](.gitignore)). Example: `mkdir -p kaggle/missionctrl-kernel` from the project root, then from your clone, copy the files the kernel will run, for example:
+   - `cp notebook.ipynb kaggle/missionctrl-kernel/`
+   - If the notebook will **not** `git clone` a public URL inside Kaggle, also copy at least: `train.py`, `environment.py`, `reward_model.py`, `grpo_rewards.py` (and any other local files those import), into the same directory so `python train.py` and the notebook can resolve imports.
+3. **Kernel metadata:** from [kaggle/kernel-metadata.example.json](kaggle/kernel-metadata.example.json) copy to `kaggle/missionctrl-kernel/kernel-metadata.json` and set `id` to your slug `YourKaggleUsername/unique-kernel-name`, `title`, and `code_file` to the notebook name (e.g. `notebook.ipynb`). Alternatively run `kaggle kernels init -p kaggle/missionctrl-kernel` and merge the fields to match the [Kaggle kernel metadata spec](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md#contents). You must have `language` / `kernel_type` / `code_file` correct; set `"enable_internet": "true"`, `"enable_gpu": "true"`, and optional `dataset_sources` if the code is loaded from a Kaggle dataset instead of being copied in.
+4. **Push** from the repo (paths relative to the folder you pass to `-p`):
+   - `kaggle kernels push -p kaggle/missionctrl-kernel`
+5. Open the **kernel URL** the CLI prints. In **Settings**, set **2 × T4** and confirm **Internet** is on; **Save** / **Run** the notebook as you would in Option A.
+6. (Optional) After a successful run with the right settings: `kaggle kernels pull -k <username>/<kernel-slug> -p <dir> -m` to refresh `kernel-metadata.json` for the next `push` ([Kaggle kernels: pull with metadata](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels.md)).
+
+```mermaid
+flowchart LR
+  local[local_MissionCtrl]
+  bundle[kernel_push_folder]
+  push[kernels_push]
+  ui[Editor_Settings_2xT4]
+  train[run_train.py_or_notebook]
+  local -->|copy_or_git_clone| bundle
+  bundle --> push
+  push --> ui
+  ui --> train
+```
+
+#### Training run checklist (Options A and B)
+
+- [ ] Kaggle **Secret** `HF_TOKEN` attached; gated models accepted on HuggingFace.
+- [ ] `HF_REPO` in `train.py` is your real Hub id (not a placeholder).
+- [ ] Optional: run `python train.py --smoke-train` before a long run; see the **GRPO / LoRA training** table above for `MISSIONCTRL_MODEL_NAME`, `MISSIONCTRL_SMOKE_STEPS`, `MISSIONCTRL_DEVICE_MAP`, etc.
+- [ ] If two CUDA devices are visible, [`train.py`](train.py) uses a shorter curriculum but keeps GRPO generation on one CUDA device by default; `accelerate launch` multi-process DDP is not the default path in this project.
+
+#### API limits and troubleshooting
+
+- `enable_gpu` in metadata does not guarantee a specific **GPU type**; **2 × T4** is chosen in the **Kaggle web UI** when the option is not reflected after `push` ([kernels_metadata.md](https://github.com/Kaggle/kaggle-api/blob/main/docs/kernels_metadata.md) lists supported fields; accelerator-class selection has been a common limitation).
+- 2× T4 GRPO is **slow** compared to a single A100; wall time and session limits still apply.
+- Tensor device mismatch (`cuda:0` vs `cuda:1`) during GRPO generation: leave `MISSIONCTRL_DEVICE_MAP` unset so `train.py` does not split the model across T4s.
+- OOM or driver issues: try a lower `MISSIONCTRL_LORA_RANK` (see the table above), or use `MISSIONCTRL_SMOKE_STEPS` before a long run.
+- There is no Kaggle “job runner” in Cursor: training runs in the Kaggle **session** or a kernel you start from the site.
+
+#### Local Kaggle CLI: install and token
+
+Use the official CLI to **push** kernels, download datasets, and list competitions.
+
+- **Install** (isolated venv; on many distros the system Python is *externally managed* and cannot take global `pip` without flags):
+
+  ```bash
+  python3 -m venv .venv-cli
+  .venv-cli/bin/pip install -e ".[kaggle]"
+  ```
+
+- **Token:** the client reads, in order: the `KAGGLE_API_TOKEN` environment variable, or the full token in `~/.kaggle/access_token` (one line, `chmod 600`). The env value may be a literal token or a **path to a file** (see the [Kaggle access-token behavior](https://github.com/Kaggle/kaggle-api)). Do not commit API tokens. If a token is exposed, revoke it in [Kaggle account settings](https://www.kaggle.com/settings) and create a new one.
+- **Check:** `.venv-cli/bin/kaggle --version` prints a version. An online test such as `kaggle competitions list -s titanic` confirms authentication.
+- **Optional:** add `export KAGGLE_API_TOKEN=...` to `~/.zshrc` for a persistent env-based login; keep that out of the repo. A one-off `export` in the shell is fine for a single session.
 
 ### Configuration Notes
 
 **Inference vs Training:**
-- The `.env.example` file configures the **inference server** (FastAPI + external LLM API via `API_BASE_URL` and `MODEL_NAME`)
-- The `train.py` script uses **local Unsloth** for GRPO fine-tuning (separate stack from inference)
-- For training, you only need to set `HF_REPO` in `train.py` and authenticate with HuggingFace
-- For inference, configure `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` in `.env`
+- The `.env` / `.env.example` variables `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` configure the **LLM client** used by [`client.py`](client.py) and [`inference.py`](inference.py). The FastAPI app under [`server/`](server/) serves the MissionCtrl environment over HTTP; it does **not** read those LLM variables unless you add wiring yourself.
+- The `train.py` script uses **local Unsloth** for GRPO fine-tuning (separate stack from inference).
+- For training, you set `HF_REPO` in `train.py` and authenticate with HuggingFace (e.g. `HF_TOKEN` in the shell or Kaggle Secrets).
+- For inference, set `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` in `.env` to the **same** provider stack you want graded (see checklist below).
+
+**Hugging Face inference (router vs dedicated endpoint):**
+- **Router** (`https://router.huggingface.co/v1`): use a `MODEL_NAME` the router actually routes (see Hugging Face docs for current catalog). There is **no** automatic fallback to classic Hub `inputs` JSON from `inference.py`.
+- **Dedicated Inference Endpoint** (`https://…endpoints.huggingface.cloud/…`): `inference.py` appends `/v1` when missing so the OpenAI client hits `…/v1/chat/completions`. If chat is unsupported but the deployment still serves **text-generation** on the root URL, either rely on the built-in fallback (when the chat error looks like a route/surface issue) or set `MISSIONCTRL_HF_LLM_STRATEGY=native_only` to call native generation directly.
+- **Misconfiguration** (wrong model id, auth, or context limits) surfaces as a non-retrying `LlmConfigurationError` with a short hint instead of a long blind retry loop.
 
 ### Evaluation and training alignment checklist
 
 Hackathon and OpenEnv evaluators run **`inference.py` / `client.py` against your configured API**, not the Unsloth process. Fine-tuning improves the score only if the **same** `API_BASE_URL` and `MODEL_NAME` point at a stack that actually loads your trained adapter.
 
-1. **Confirm the scoring model** — After `train.py` pushes a LoRA adapter to HuggingFace, point inference at a **router or provider** that can serve the **base** `Qwen/Qwen2.5-7B-Instruct` (or your chosen base) **plus** that adapter. If you leave defaults (`openai/gpt-oss-120b`, Groq `llama-3.3-70b-versatile`, etc.), you are not evaluating the weights you trained.
-2. **Match base model ID** — Training in `train.py` defaults to `Qwen/Qwen2.5-7B-Instruct`. Your inference `MODEL_NAME` and adapter must be **compatible** with that base.
+1. **Confirm the scoring model** — After `train.py` pushes a LoRA adapter to HuggingFace, point inference at a **router or provider** that can serve the **base** you trained (default: `Qwen/Qwen2.5-0.5B-Instruct`, or whatever you set in `MISSIONCTRL_MODEL_NAME`) **plus** that adapter. If you leave inference defaults (`openai/gpt-oss-120b`, Groq `llama-3.3-70b-versatile`, etc.), you are not evaluating the weights you trained.
+2. **Match base model ID** — Training defaults to `Qwen/Qwen2.5-0.5B-Instruct`. For a larger hub, set `MISSIONCTRL_MODEL_NAME` (e.g. `unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit`) before training. Your served `MODEL_NAME` and LoRA must match the **same** base you fine-tuned.
 3. **Reproduce before submit** — From the same repo: run the server, set `API_BASE_URL` / `MODEL_NAME` / `HF_TOKEN` in `.env` to the intended eval stack, then run `python client.py` or `python inference.py` and compare scores to a smoke run on a public baseline model.
-4. **HF Hub is adapter by default** — `train.py` calls `push_to_hub` for the PEFT/LoRA adapter. Consumers must load **base + adapter** (e.g. Unsloth/PEFT on Colab) unless you add a separate merge/publish step.
+4. **HF Hub is adapter by default** — `train.py` calls `push_to_hub` for the PEFT/LoRA adapter. Consumers must load **base + adapter** (for example with Unsloth/PEFT) unless you add a separate merge/publish step.
 
-**Training-only environment variables (optional, e.g. Colab or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
+**Workflow:** run a full job with defaults (`Qwen/Qwen2.5-0.5B-Instruct`) first; when you need more capacity, re-run with `MISSIONCTRL_MODEL_NAME` set to a larger hub id. Optionally `python train.py --smoke-train` with that id to OOM-check before a long run.
 
-### Colab and Cursor (user-colab-mcp)
+**Training-only environment variables (optional, e.g. Kaggle Add-ons → Environment or shell before `python train.py`):** see **GRPO / LoRA training (optional)** in the environment variables section above.
 
-- **Google Colab:** Run `notebook.ipynb` or `train.py` in Colab with a GPU runtime. The training script can persist checkpoints under Google Drive when `google.colab` is available.
-- **Cursor / MCP:** If the **user-colab-mcp** server is enabled, the `open_colab_browser_connection` tool opens a **browser connection to a Colab session** so you can edit the notebook from the IDE. It does not run training on its own; you still execute cells or `train.py` in Colab.
+### Kaggle and Cursor
+
+- **Kaggle:** See **Kaggle training and Kaggle CLI** above. `notebook.ipynb` targets Kaggle 2×T4; checkpoints default to `/kaggle/working/missionctrl_checkpoints` on Kaggle.
+- **Cursor:** Kaggle is not started from Cursor. Use Cursor to edit the repo/kernel files, then run training in the Kaggle browser session or pushed kernel.
 
 ### Troubleshooting: Request Too Large / TPM Errors
 
