@@ -130,8 +130,9 @@ def grpo_reward_fn(completions: list[Any], prompts: list, **kwargs) -> list[floa
     but requires a larger TRL integration change.)
 
     FIX #3: Returns the FINAL reward (single composite score at episode end),
-    not a sum of per-step rewards. compute_reward returns a state score [0,1],
-    and summing state scores across steps is meaningless.
+    not a sum of per-step rewards. compute_reward returns a state score in the
+    strict open interval (0, 1) (same ε-clamp as the HTTP grader), and summing
+    state scores across steps is meaningless.
 
     FIX #20: Exceptions are now logged (not silently swallowed).
 

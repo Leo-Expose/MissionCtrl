@@ -10,8 +10,11 @@ Signal breakdown:
   4. Delegation Efficiency         (15%) — did the overseer use redelegation wisely?
   5. LLM-as-Judge Reasoning        (10%) — was the overseer's reasoning high quality?
 
-Total reward clipped to [0, 1].
-Theoretical ceiling: 0.85 (when FP rate = 0).  # FIX #5: corrected from 1.0
+Composite **episode** score is clamped to the strict open interval **(0, 1)** with
+ε = 0.01 (same as `server/environment.py` / OpenEnv validators). Per-signal values
+remain in [0, 1] where noted.
+
+Theoretical ceiling of the **weighted sum** (before clamp): **0.85** when FP rate = 0.
   Calculation: 0.30×1 + 0.30×1 + (−0.15)×0 + 0.15×1 + 0.10×1 = 0.85
 """
 
@@ -20,6 +23,15 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from environment import MissionCtrlEnv
+
+# Open-interval composite score — matches server/environment.py and hackathon validators.
+_SCORE_EPS = 0.01
+
+
+def _clamp_open_interval(val: float) -> float:
+    """Clamp final composite reward to (0, 1) with epsilon margin."""
+    return max(_SCORE_EPS, min(1.0 - _SCORE_EPS, val))
+
 
 # Hallucination-related evidence keywords for the heuristic judge
 EVIDENCE_KEYWORDS = [
@@ -329,7 +341,7 @@ WEIGHTS = {
 def compute_reward(env: "MissionCtrlEnv", use_mock: bool = True) -> float:
     """
     Composite reward for the OverseerAgent.
-    Returns float in [0, 1].
+    Returns float strictly in (0, 1) — see `_clamp_open_interval` / `_SCORE_EPS`.
 
     r = 0.30 × task_completion
       + 0.30 × hallucination_detection
@@ -337,10 +349,11 @@ def compute_reward(env: "MissionCtrlEnv", use_mock: bool = True) -> float:
       + 0.15 × delegation_efficiency
       + 0.10 × llm_judge_quality
 
-    FIX #5: Theoretical ceiling is 0.85 (not 1.0), achieved when:
+    FIX #5: Theoretical ceiling of the raw weighted sum is 0.85 (not 1.0), achieved when:
       task_completion=1, hallucination_det=1, false_positive=0,
       delegation_eff=1, llm_judge=1 → 0.30+0.30+0+0.15+0.10 = 0.85
-    FIX #37: Score is clamped to [0.0, 1.0] (closed interval, not open).
+    FIX #37: Final returned score uses the same open-interval clamp as the HTTP engine
+      (`max(ε, min(1−ε, raw))`) so GRPO / root env parity matches OpenEnv validation.
     """
     s1 = signal_task_completion(env)
     s2 = signal_hallucination_detection(env)
@@ -356,7 +369,7 @@ def compute_reward(env: "MissionCtrlEnv", use_mock: bool = True) -> float:
         + WEIGHTS["llm_judge"]         * s5
     )
 
-    return max(0.0, min(1.0, reward))
+    return _clamp_open_interval(reward)
 
 
 def reward_breakdown(env: "MissionCtrlEnv", use_mock: bool = True) -> dict:
