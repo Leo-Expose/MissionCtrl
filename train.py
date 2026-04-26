@@ -962,7 +962,8 @@ def train():
         print(f"  ℹ️  Smoke run: skipped push_to_hub (local adapter: {OUTPUT_DIR}/final_lora)")
     else:
         print(f"\n📤 Pushing to HuggingFace Hub: {HF_REPO}")
-        model.push_to_hub(HF_REPO, tokenizer=tokenizer)
+        model.push_to_hub(HF_REPO)
+        tokenizer.push_to_hub(HF_REPO)
         print(f"  ✅ LoRA adapter uploaded → https://huggingface.co/{HF_REPO}")
     print(f"  ℹ️  To use: load base model + adapter via PEFT/Unsloth")
 
